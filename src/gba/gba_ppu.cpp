@@ -177,9 +177,16 @@ void GbaPpu::reset() {
     vcount_ = 0;
     frame_count_ = 0;
     has_latched_fb_ = false;
+    has_latched_layered_fb_ = false;
     affine_line_ = {};
     std::memset(latched_fb_.data(), 0xFF, latched_fb_.size());
     std::memset(work_fb_.data(), 0xFF, work_fb_.size());
+    if (!work_layered_fb_.empty()) {
+        std::memset(work_layered_fb_.data(), 0, work_layered_fb_.size());
+    }
+    if (!latched_layered_fb_.empty()) {
+        std::memset(latched_layered_fb_.data(), 0, latched_layered_fb_.size());
+    }
 }
 
 void GbaPpu::set_view_margins(uint32_t left, uint32_t right,
@@ -677,12 +684,21 @@ void render_scanline_internal(uint8_t* rgb,
                               const uint8_t* oam,
                               const uint8_t* pal,
                               uint32_t kScreenWidth,
-                              uint32_t kScreenHeight) {
+                              uint32_t kScreenHeight,
+                              uint8_t* layered_rgba = nullptr) {
     if (y >= kScreenHeight) return;
 
     uint8_t* row = rgb + y * kScreenWidth * 3;
     if (dispcnt & 0x0080u) {
         std::memset(row, 0xFF, kScreenWidth * 3);
+        if (layered_rgba) {
+            const size_t plane_stride = static_cast<size_t>(kScreenWidth) * kScreenHeight * 4u;
+            const size_t row_off = static_cast<size_t>(y) * kScreenWidth * 4u;
+            std::memset(layered_rgba + row_off, 0xFF, kScreenWidth * 4u);
+            for (uint32_t p = 1; p < GbaPpu::kLayeredPlanes; ++p) {
+                std::memset(layered_rgba + p * plane_stride + row_off, 0, kScreenWidth * 4u);
+            }
+        }
         return;
     }
 
@@ -777,6 +793,13 @@ void render_scanline_internal(uint8_t* rgb,
 
     PixelCandidate top[GbaPpu::kScreenWidth];
     PixelCandidate second[GbaPpu::kScreenWidth];
+    thread_local std::vector<PixelCandidate> bucket_top;
+    thread_local std::vector<PixelCandidate> bucket_second;
+    if (layered_rgba) {
+        const size_t bucket_count = static_cast<size_t>(GbaPpu::kLayeredPlanes) * kScreenWidth;
+        bucket_top.assign(bucket_count, PixelCandidate{});
+        bucket_second.assign(bucket_count, PixelCandidate{});
+    }
     // This is deliberately a per-layer candidate, not a copy of `top`: a
     // room BG with higher priority may cover the HUD's BG0 cells. Capturing
     // only the explicitly declared source map cells keeps that room terrain
@@ -801,6 +824,9 @@ void render_scanline_internal(uint8_t* rgb,
         top[x].target1 = blend_enabled(x) && ((first_targets & (1u << 5)) != 0);
         top[x].target2 = (second_targets & (1u << 5)) != 0;
         top[x].valid = true;
+        if (layered_rgba) {
+            bucket_top[x] = top[x];
+        }
     }
     auto submit = [&](uint32_t x,
                       uint16_t color,
@@ -823,6 +849,24 @@ void render_scanline_internal(uint8_t* rgb,
             top[x] = cand;
         } else if (key < second[x].key) {
             second[x] = cand;
+        }
+        if (layered_rgba) {
+            uint32_t plane = 0;
+            if (layer != 5 && key < 0x70000000) {
+                int prio = key >> 8;
+                if (prio < 0) prio = 0;
+                else if (prio > 3) prio = 3;
+                plane = static_cast<uint32_t>(4 - prio);
+            }
+            const size_t idx = static_cast<size_t>(plane) * kScreenWidth + x;
+            PixelCandidate& btop = bucket_top[idx];
+            PixelCandidate& bsec = bucket_second[idx];
+            if (key < btop.key) {
+                bsec = btop;
+                btop = cand;
+            } else if (key < bsec.key) {
+                bsec = cand;
+            }
         }
     };
 
@@ -1341,6 +1385,82 @@ void render_scanline_internal(uint8_t* rgb,
             dst[1] = top[x].rgb[1];
             dst[2] = top[x].rgb[2];
 #endif
+        }
+    }
+
+    if (layered_rgba) {
+        const uint32_t eva = std::min<uint32_t>(bldalpha & 0x1Fu, 16u);
+        const uint32_t evb = std::min<uint32_t>((bldalpha >> 8) & 0x1Fu, 16u);
+        const size_t plane_stride = static_cast<size_t>(kScreenWidth) * kScreenHeight * 4u;
+        const size_t row_off = static_cast<size_t>(y) * kScreenWidth * 4u;
+        auto write_candidate_rgb = [](const PixelCandidate& c, uint8_t* out) {
+#if defined(GBARECOMP_SCANLINE_HLE)
+            to_rgb888(c.color, out);
+#else
+            out[0] = c.rgb[0];
+            out[1] = c.rgb[1];
+            out[2] = c.rgb[2];
+#endif
+        };
+
+        for (uint32_t p = 0; p < GbaPpu::kLayeredPlanes; ++p) {
+            uint8_t* plane_row = layered_rgba + p * plane_stride + row_off;
+            for (uint32_t x = 0; x < kScreenWidth; ++x) {
+                uint8_t* dst = plane_row + x * 4u;
+                const size_t idx = static_cast<size_t>(p) * kScreenWidth + x;
+                const PixelCandidate& btop = bucket_top[idx];
+                if (!btop.valid) {
+                    dst[0] = 0;
+                    dst[1] = 0;
+                    dst[2] = 0;
+                    dst[3] = 0;
+                    continue;
+                }
+
+                const PixelCandidate& bsec = bucket_second[idx];
+                const PixelCandidate* below = bsec.valid ? &bsec : nullptr;
+                const bool same_plane_below = (below != nullptr);
+                if (!below && p > 0) {
+                    for (int q = static_cast<int>(p) - 1; q >= 0; --q) {
+                        const PixelCandidate& cand =
+                            bucket_top[static_cast<size_t>(q) * kScreenWidth + x];
+                        if (cand.valid) {
+                            below = &cand;
+                            break;
+                        }
+                    }
+                }
+
+                if ((effect == 1u || btop.layer == 4u) &&
+                    btop.target1 && below && below->target2 &&
+                    !(btop.layer == 4u && below->layer == 4u)) {
+                    if (!same_plane_below && eva == 0u && evb == 16u) {
+                        dst[0] = 0;
+                        dst[1] = 0;
+                        dst[2] = 0;
+                        dst[3] = 0;
+                    } else if (!same_plane_below && evb > 0u && (eva + evb) == 16u) {
+                        write_candidate_rgb(btop, dst);
+                        dst[3] = static_cast<uint8_t>(
+                            std::min<uint32_t>(255u, (eva * 255u + 8u) / 16u));
+                    } else {
+                        const uint16_t blended = blend_alpha_gba555(
+                            btop.color, below->color,
+                            bldalpha & 0x1Fu, (bldalpha >> 8) & 0x1Fu);
+                        to_rgb888(blended, dst);
+                        dst[3] = 255;
+                    }
+                } else if ((effect == 2u || effect == 3u) && bldy != 0u && btop.target1) {
+                    const uint16_t adjusted = (effect == 2u)
+                        ? brighten_gba555(btop.color, bldy)
+                        : darken_gba555(btop.color, bldy);
+                    to_rgb888(adjusted, dst);
+                    dst[3] = 255;
+                } else {
+                    write_candidate_rgb(btop, dst);
+                    dst[3] = 255;
+                }
+            }
         }
     }
     return;
@@ -2441,7 +2561,8 @@ void GbaPpu::render_scanline(uint32_t y,
     if (!view_expanded()) {
         render_scanline_internal(work_fb_.data(), y, dispcnt,
                                  affine_io.data(), vram, oam, pal,
-                                 kScreenWidth, kScreenHeight);
+                                 kScreenWidth, kScreenHeight,
+                                 layered_3d_ ? work_layered_fb_.data() : nullptr);
         if (hd_line) {
             // The expanded compositor may apply optional presentation filters.
             // Keep its native scratch entirely separate from canonical pixels.
@@ -2491,9 +2612,28 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
     mark_framebuffer_latched();
 }
 
+void GbaPpu::set_layered_3d(bool enabled) {
+    if (layered_3d_ == enabled) return;
+    layered_3d_ = enabled;
+    has_latched_layered_fb_ = false;
+    if (enabled) {
+        work_layered_fb_.assign(kLayeredFramebufferBytes, 0);
+        latched_layered_fb_.assign(kLayeredFramebufferBytes, 0);
+    } else {
+        std::vector<uint8_t>().swap(work_layered_fb_);
+        std::vector<uint8_t>().swap(latched_layered_fb_);
+    }
+}
+
 void GbaPpu::mark_framebuffer_latched() {
-    if (rasterization_enabled_)
+    if (rasterization_enabled_) {
         std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
+        if (layered_3d_ && work_layered_fb_.size() == kLayeredFramebufferBytes) {
+            std::memcpy(latched_layered_fb_.data(), work_layered_fb_.data(),
+                        kLayeredFramebufferBytes);
+            has_latched_layered_fb_ = true;
+        }
+    }
     has_latched_fb_ = true;
     if (high_resolution_) high_resolution_->latch();
     if (presentation_) presentation_->frame_ready();

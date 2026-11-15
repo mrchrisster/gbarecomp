@@ -201,6 +201,17 @@ public:
     const uint8_t* latched_framebuffer() const { return latched_fb_.data(); }
     bool has_latched_framebuffer() const { return has_latched_fb_; }
 
+    static constexpr uint32_t kLayeredPlanes = 5;
+    static constexpr size_t kLayeredPlaneBytes =
+        static_cast<size_t>(kScreenWidth) * kScreenHeight * 4u;
+    static constexpr size_t kLayeredFramebufferBytes =
+        kLayeredPlaneBytes * kLayeredPlanes;
+    void set_layered_3d(bool enabled);
+    bool layered_3d() const { return layered_3d_; }
+    const uint8_t* latched_layered_3d() const {
+        return (layered_3d_ && has_latched_layered_fb_) ? latched_layered_fb_.data() : nullptr;
+    }
+
 private:
     friend class SimulationStateCodec;
     std::unique_ptr<GbaHighResolutionFrame> high_resolution_;
@@ -226,6 +237,10 @@ private:
     std::vector<uint8_t> work_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     std::vector<uint8_t> latched_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     bool has_latched_fb_ = false;
+    bool layered_3d_ = false;
+    bool has_latched_layered_fb_ = false;
+    std::vector<uint8_t> work_layered_fb_;
+    std::vector<uint8_t> latched_layered_fb_;
 
     struct AffineLineState {
         int32_t x = 0;

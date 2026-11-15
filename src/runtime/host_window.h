@@ -141,6 +141,8 @@ public:
 
     // Short vibration where the platform supports it (no-op otherwise).
     void haptic_pulse(int duration_ms, float strength);
+    // Cartridge rumble state (used by WarioWare: Twisted! GPIO pin 3).
+    void set_rumble(bool on);
 
     void set_fps_readout(bool on);      // presents-per-second in the title bar
     bool fps_readout() const;
@@ -154,6 +156,10 @@ public:
     // The enhanced texture is uploaded and presented directly, without a
     // native-resolution intermediate render target.
     void present(const uint8_t* rgb888, unsigned width, unsigned height);
+    // Present 5 GBA priority planes (RGBA8888, 0 = Backdrop .. 4 = Priority 0)
+    // when rendering in stereoscopic layered 3D mode (Quest OpenXR).
+    void present_layered_3d(const uint8_t* planes_rgba, unsigned width, unsigned height,
+                            unsigned plane_count);
 
     // Push `count` int16_t mono samples into the audio output queue. The SDL
     // backend configures its resampler for a 65.536 kHz source; the real

@@ -27,7 +27,10 @@
 
 #include "bios_hle.h"
 
+#include "gba_bus.h"
+#include "runtime.h"
 #include "runtime_arm.h"  // g_cpu, runtime_tick, bus_read_u*/bus_write_u*
+#include "runtime_bus_bridge.h"
 
 #include <cmath>
 #include <cstdint>
@@ -38,6 +41,7 @@ namespace gba {
 namespace {
 
 BiosHleMode g_mode = BiosHleMode::Off;
+bool g_full_fallback = false;
 
 // ── register / memory shorthands ───────────────────────────────────────────
 inline uint32_t  R(int i)               { return g_cpu.R[i]; }
@@ -501,6 +505,55 @@ int dispatch(uint32_t swi) {
     case SWI_DIFF_16BIT_UNFILTER:     do_unFilter(2, 2); break;
     case SWI_SOUND_BIAS:       wr16(REG_SOUNDBIAS, static_cast<uint16_t>(R(0) ? 0x200 : 0)); break;
     case SWI_MIDI_KEY_2_FREQ:  do_midi_key_2_freq(); break;
+    case SWI_REGISTER_RAM_RESET: {
+        if (!g_full_fallback) return 0;
+        const uint32_t flags = R(0);
+        if (flags & 0x01u) { for (uint32_t a = 0x02000000u; a < 0x02040000u; a += 4) wr32(a, 0); }
+        if (flags & 0x02u) { for (uint32_t a = 0x03000000u; a < 0x03007E00u; a += 4) wr32(a, 0); }
+        if (flags & 0x04u) { for (uint32_t a = 0x05000000u; a < 0x05000400u; a += 4) wr32(a, 0); }
+        if (flags & 0x08u) { for (uint32_t a = 0x06000000u; a < 0x06018000u; a += 4) wr32(a, 0); }
+        if (flags & 0x10u) { for (uint32_t a = 0x07000000u; a < 0x07000400u; a += 4) wr32(a, 0); }
+        if (flags & 0x20u) {
+            for (uint32_t a = 0x04000120u; a <= 0x0400012Cu; a += 4) wr32(a, 0);
+            wr16(0x04000134u, 0);
+        }
+        if (flags & 0x40u) {
+            for (uint32_t a = 0x04000060u; a <= 0x04000084u; a += 4) wr32(a, 0);
+            wr16(0x04000088u, 0x0200u);
+        }
+        if (flags & 0x80u) {
+            wr16(0x04000000u, 0);
+            wr16(0x04000200u, 0);
+            wr16(0x04000208u, 0);
+        }
+        break;
+    }
+    case SWI_HALT: {
+        if (!g_full_fallback) return 0;
+        wr8(0x04000301u, 0u);
+        auto* bus = gbarecomp::active_bus();
+        for (int guard = 0; guard < 16384 && bus && bus->io().halted(); ++guard) {
+            runtime_tick(64u);
+        }
+        return 1;
+    }
+    case SWI_INTR_WAIT:
+    case SWI_VBLANK_INTR_WAIT: {
+        if (!g_full_fallback) return 0;
+        const bool clear = (swi == SWI_VBLANK_INTR_WAIT) || (R(0) != 0);
+        const uint16_t mask = static_cast<uint16_t>(
+            (swi == SWI_VBLANK_INTR_WAIT) ? 1u : (R(1) & 0xFFFFu));
+        wr16(0x04000208u, 1u);
+        if (clear) {
+            wr16(0x03007FF8u, rd16(0x03007FF8u) & ~mask);
+        }
+        for (int guard = 0; guard < 32768 && (rd16(0x03007FF8u) & mask) == 0; ++guard) {
+            wr8(0x04000301u, 0u);
+            runtime_tick(64u);
+        }
+        wr16(0x03007FF8u, rd16(0x03007FF8u) & ~mask);
+        return 1;
+    }
     default:
         return 0;  // fall through to the recompiled LLE BIOS
     }
@@ -513,6 +566,10 @@ int dispatch(uint32_t swi) {
 void bios_hle_set_mode(BiosHleMode mode) {
     g_mode = mode;
     g_bios_hle_hook = (mode == BiosHleMode::On) ? &dispatch : nullptr;
+}
+
+void bios_hle_set_full_fallback(bool enabled) {
+    g_full_fallback = enabled;
 }
 
 void bios_hle_boot_skip(uint32_t cart_entry) {

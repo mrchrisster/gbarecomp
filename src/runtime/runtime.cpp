@@ -1459,12 +1459,21 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         spec.expected_crc32 = args.bios_crc32;
         auto r = resolve_asset(args.bios, spec, argv[0]);
         if (!r.ok) {
-            std::fprintf(stderr,
-                         "[gbarecomp:runtime] BIOS resolution failed: %s\n",
-                         r.error.c_str());
-            return 1;
+            if (!netplay) {
+                std::fprintf(stderr,
+                             "[gbarecomp:runtime] BIOS not found (%s); "
+                             "falling back to built-in HLE BIOS stub\n",
+                             r.error.c_str());
+                args.bios.clear();
+            } else {
+                std::fprintf(stderr,
+                             "[gbarecomp:runtime] BIOS resolution failed: %s\n",
+                             r.error.c_str());
+                return 1;
+            }
+        } else {
+            args.bios = r.path;
         }
-        args.bios = r.path;
     }
 
     // Resolve ROM the same way. The per-game TOML supplies the
@@ -1517,9 +1526,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // empty expected hash here so a non-canonical-but-warned dump
     // doesn't trip a hard fail in the loader.
     gba::GbaBios bios;
-    if (!bios.load_from_file(args.bios, std::string{}, &err)) {
-        std::fprintf(stderr, "[gbarecomp:runtime] %s\n", err.c_str());
-        return 1;
+    if (args.bios.empty()) {
+        bios.load_hle_stub();
+    } else if (!bios.load_from_file(args.bios, std::string{}, &err)) {
+        if (!netplay) {
+            std::fprintf(stderr,
+                         "[gbarecomp:runtime] %s; falling back to built-in HLE BIOS stub\n",
+                         err.c_str());
+            bios.load_hle_stub();
+        } else {
+            std::fprintf(stderr, "[gbarecomp:runtime] %s\n", err.c_str());
+            return 1;
+        }
     }
 
     std::vector<uint8_t> rom;
@@ -1649,6 +1667,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
     }
 #endif
+    if (bios.is_hle_stub()) {
+        args.bios_hle = true;
+        args.bios_hle_keep_intro = false;
+        args.bios_skip_intro = 1;
+    }
+    gba::bios_hle_set_full_fallback(bios.is_hle_stub());
     gba::bios_hle_set_mode(args.bios_hle ? gba::BiosHleMode::On
                                          : gba::BiosHleMode::Off);
     if (!args.quiet)
@@ -2883,6 +2907,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             const auto* hd = ppu.high_resolution();
             win.present(pixels, hd->width(), hd->height());
             ++high_resolution_presented;
+        } else if (const auto* planes = ppu.latched_layered_3d()) {
+            win.present_layered_3d(planes, gba::GbaPpu::kScreenWidth,
+                                   gba::GbaPpu::kScreenHeight,
+                                   gba::GbaPpu::kLayeredPlanes);
         } else win.present(live_fb.data());
     };
     auto apply_runtime_view_geometry = [&](const ViewGeometry& geometry) -> bool {
@@ -3294,6 +3322,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
         sync_resize_driven_view();
         if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
+#if defined(GBARECOMP_QUEST_XR)
+        ppu.set_layered_3d(true);
+#endif
         pacer.emplace();  // paces to the GBA's 59.7275 Hz by default
         pacer->set_uncapped(args.uncapped); // no frame skipping/audio suppression
     }
@@ -3643,6 +3674,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 static_cast<int>(raw_offset * args.gyro_sensitivity *
                                  gyro_sensitivity_calibration),
                 -0x600, 0x600));
+        }
+        if (bus.gyro().active() && args.window) {
+            win.set_rumble(bus.gyro().rumble_on());
         }
         // Record the COMPOSED register (host keys AND any touch-policy
         // synthesis) so a replay reproduces exactly what the guest read,

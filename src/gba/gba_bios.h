@@ -41,8 +41,13 @@ public:
                         const std::string& expected_sha1,
                         std::string* err);
 
-    // True if a valid BIOS image is loaded.
+    // Populate a minimal open-source ARM7TDMI IRQ trampoline stub so games can
+    // boot and run in full HLE mode when no retail BIOS dump is supplied.
+    void load_hle_stub();
+
+    // True if a valid BIOS image (or HLE stub) is loaded.
     bool loaded() const { return loaded_; }
+    bool is_hle_stub() const { return hle_stub_; }
 
     // SHA-1 hex of the loaded BIOS bytes (set after a successful
     // load).
@@ -57,6 +62,7 @@ public:
 
 private:
     bool loaded_ = false;
+    bool hle_stub_ = false;
     std::array<uint8_t, kSize> bytes_{};
     std::string sha1_hex_;
 };

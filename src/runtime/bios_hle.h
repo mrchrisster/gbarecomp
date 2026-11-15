@@ -37,6 +37,7 @@ enum class BiosHleMode {
 // Install or clear the runtime_swi HLE hook. Off clears g_bios_hle_hook back to
 // nullptr (pure LLE). Safe to call once at runtime bring-up.
 void bios_hle_set_mode(BiosHleMode mode);
+void bios_hle_set_full_fallback(bool enabled);
 
 // Current mode (for the startup banner / diagnostics).
 BiosHleMode bios_hle_mode();

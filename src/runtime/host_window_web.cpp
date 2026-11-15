@@ -484,6 +484,8 @@ void HostWindow::haptic_pulse(int duration_ms,float strength) {
     // and is absent on some browsers (then this is a no-op, reported once).
     MAIN_THREAD_ASYNC_EM_ASM({ globalThis.GbrHost?.haptic?.($0); },std::clamp(duration_ms,1,5000));
 }
+void HostWindow::present_layered_3d(const uint8_t*, unsigned, unsigned, unsigned) {}
+void HostWindow::set_rumble(bool) {}
 void host_haptic_pulse(int duration_ms,float strength) {
     if(g_haptic_window) g_haptic_window->haptic_pulse(duration_ms,strength);
 }

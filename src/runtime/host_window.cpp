@@ -2201,6 +2201,12 @@ bool HostWindow::drawable_size(int* width, int* height) const {
 
 void HostWindow::present(const uint8_t* rgb888) { present(rgb888, 0, 0); }
 
+void HostWindow::present_layered_3d(const uint8_t* planes_rgba, unsigned width,
+                                      unsigned height, unsigned /*plane_count*/) {
+    if (!planes_rgba || width == 0 || height == 0) return;
+    // Desktop SDL fallback composites via standard single-plane present().
+}
+
 void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sampled_h) {
     if (!open_ || !impl_ || !rgb888) return;
     auto* b = static_cast<Backend*>(impl_);
@@ -2742,6 +2748,16 @@ void HostWindow::haptic_pulse(int duration_ms, float strength) {
                              static_cast<Uint32>(duration_ms));
 }
 
+void HostWindow::set_rumble(bool on) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (on) {
+        haptic_pulse(32, 0.65f);
+    } else if (b->haptic) {
+        SDL_HapticRumbleStop(b->haptic);
+    }
+}
+
 void host_haptic_pulse(int duration_ms, float strength) {
     if (g_haptic_window) g_haptic_window->haptic_pulse(duration_ms, strength);
 }
@@ -3166,6 +3182,7 @@ bool HostWindow::drawable_size(int* /*width*/, int* /*height*/) const {
 
 void HostWindow::present(const uint8_t* /*rgb888*/) {}
 void HostWindow::present(const uint8_t*, unsigned, unsigned) {}
+void HostWindow::present_layered_3d(const uint8_t*, unsigned, unsigned, unsigned) {}
 
 void HostWindow::load_input_config(const char* /*dir*/,
                                    bool /*assist_tools_default*/,
@@ -3196,6 +3213,7 @@ float HostWindow::px_per_mm() const { return 96.0f / 25.4f; }
 void HostWindow::set_presentation_anchor_top(bool) {}
 bool HostWindow::wait_for_foreground() { return false; }
 void HostWindow::haptic_pulse(int, float) {}
+void HostWindow::set_rumble(bool) {}
 void host_haptic_pulse(int, float) {}
 void host_request_settings_menu() {}
 void HostWindow::set_fps_readout(bool /*on*/) {}
