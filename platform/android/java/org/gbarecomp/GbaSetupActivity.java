@@ -49,6 +49,10 @@ public class GbaSetupActivity extends Activity {
     /** Validation/launcher-shortcut extra: start the game when ready without
      *  changing the player's skip-this-screen preference. */
     public static final String EXTRA_AUTOSTART = "org.gbarecomp.extra.AUTOSTART";
+    /** Force the setup screen even when the files are already verified, so
+     *  the player can re-pick them (e.g. `adb shell am start ... --ez
+     *  org.gbarecomp.extra.SHOW_SETUP true`). */
+    public static final String EXTRA_SHOW_SETUP = "org.gbarecomp.extra.SHOW_SETUP";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private GbaGameConfig config;
@@ -77,15 +81,42 @@ public class GbaSetupActivity extends Activity {
             finish();
             return;
         }
+        // Files were already imported on an earlier launch: go straight to
+        // the game and drop this screen so it never sits under the game.
+        if (shouldSkipSetup(getIntent())) {
+            startGameAndFinish();
+            return;
+        }
         setContentView(buildContent());
         enterImmersiveMode();
         refreshStatus();
-        if (!ready()) return;
-        if (getIntent().getBooleanExtra(EXTRA_AUTOSTART, false)) {
-            startActivity(new Intent(this, gameActivityClass()));
-        } else if (skipLauncherOnBoot()) {
-            launchGame();
-        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // singleTask relaunch of a setup screen that is still alive.
+        if (shouldSkipSetup(intent)) startGameAndFinish();
+    }
+
+    private boolean shouldSkipSetup(Intent intent) {
+        if (intent != null && intent.getBooleanExtra(EXTRA_SHOW_SETUP, false)) return false;
+        if (!assetsOnDisk()) return false;
+        return (intent != null && intent.getBooleanExtra(EXTRA_AUTOSTART, false))
+            || skipLauncherOnBoot();
+    }
+
+    /** Same checks refreshStatus() uses, without needing the views. */
+    private boolean assetsOnDisk() {
+        boolean rom = romFile().isFile() && romFile().length() == config.romSize;
+        boolean bios = biosFile().isFile() && biosFile().length() == BIOS_SIZE;
+        return rom && (bios || !config.biosRequired);
+    }
+
+    private void startGameAndFinish() {
+        startActivity(new Intent(this, gameActivityClass()));
+        finish();
     }
 
     @Override
@@ -345,7 +376,7 @@ public class GbaSetupActivity extends Activity {
             .putBoolean(SKIP_LAUNCHER_ON_BOOT,
                 skipLauncherCheck == null || skipLauncherCheck.isChecked())
             .apply();
-        startActivity(new Intent(this, gameActivityClass()));
+        startGameAndFinish();
     }
 
     private boolean skipLauncherOnBoot() {

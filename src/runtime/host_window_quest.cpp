@@ -27,14 +27,18 @@
 #include <SDL_system.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -87,6 +91,108 @@ XrVector3f rotate_vec(const XrQuaternionf& q, float vx, float vy, float vz) {
         vy + q.w * ty + (q.z * tx - q.x * tz),
         vz + q.w * tz + (q.x * ty - q.y * tx),
     };
+}
+
+XrVector3f v3_add(const XrVector3f& a, const XrVector3f& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+XrVector3f v3_sub(const XrVector3f& a, const XrVector3f& b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+XrVector3f v3_scale(const XrVector3f& v, float s) {
+    return {v.x * s, v.y * s, v.z * s};
+}
+
+float v3_dot(const XrVector3f& a, const XrVector3f& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+XrVector3f v3_cross(const XrVector3f& a, const XrVector3f& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
+}
+
+float v3_len(const XrVector3f& v) {
+    return std::sqrt(v3_dot(v, v));
+}
+
+XrVector3f v3_norm(const XrVector3f& v, const XrVector3f& fallback = {0.0f, 0.0f, -1.0f}) {
+    const float l = v3_len(v);
+    return (l > 1e-5f) ? v3_scale(v, 1.0f / l) : fallback;
+}
+
+XrQuaternionf quat_normalize(const XrQuaternionf& q) {
+    const float n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if (n < 1e-6f) return {0.0f, 0.0f, 0.0f, 1.0f};
+    return {q.x / n, q.y / n, q.z / n, q.w / n};
+}
+
+XrQuaternionf quat_from_two_unit_vecs(const XrVector3f& u, const XrVector3f& v) {
+    const float d = v3_dot(u, v);
+    if (d >= 0.99999f) return {0.0f, 0.0f, 0.0f, 1.0f};
+    if (d <= -0.99999f) {
+        XrVector3f ortho = v3_cross({1.0f, 0.0f, 0.0f}, u);
+        if (v3_len(ortho) < 1e-3f) ortho = v3_cross({0.0f, 1.0f, 0.0f}, u);
+        ortho = v3_norm(ortho, {0.0f, 1.0f, 0.0f});
+        return {ortho.x, ortho.y, ortho.z, 0.0f};
+    }
+    const XrVector3f c = v3_cross(u, v);
+    return quat_normalize({c.x, c.y, c.z, 1.0f + d});
+}
+
+// Convert orthonormal right (X), up (Y), forward-normal (Z) basis columns into a unit quaternion.
+XrQuaternionf quat_from_basis(const XrVector3f& x_col, const XrVector3f& y_col, const XrVector3f& z_col) {
+    const float m00 = x_col.x, m01 = y_col.x, m02 = z_col.x;
+    const float m10 = x_col.y, m11 = y_col.y, m12 = z_col.y;
+    const float m20 = x_col.z, m21 = y_col.z, m22 = z_col.z;
+    const float tr = m00 + m11 + m22;
+    XrQuaternionf q{};
+    if (tr > 0.0f) {
+        const float s = std::sqrt(tr + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (m21 - m12) / s;
+        q.y = (m02 - m20) / s;
+        q.z = (m10 - m01) / s;
+    } else if (m00 > m11 && m00 > m22) {
+        const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+        q.w = (m21 - m12) / s;
+        q.x = 0.25f * s;
+        q.y = (m01 + m10) / s;
+        q.z = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+        q.w = (m02 - m20) / s;
+        q.x = (m01 + m10) / s;
+        q.y = 0.25f * s;
+        q.z = (m12 + m21) / s;
+    } else {
+        const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+        q.w = (m10 - m01) / s;
+        q.x = (m02 + m20) / s;
+        q.y = (m12 + m21) / s;
+        q.z = 0.25f * s;
+    }
+    return quat_normalize(q);
+}
+
+// Build a screen orientation facing the viewer (-to_screen_dir) while blending between
+// world-up (when sitting/standing upright) and head/custom up (when laying down).
+XrQuaternionf make_screen_orientation(const XrVector3f& to_screen_dir,
+                                      const XrVector3f& ref_up_hint,
+                                      const XrVector3f& fallback_right) {
+    const XrVector3f z_col = v3_norm(v3_scale(to_screen_dir, -1.0f), {0.0f, 0.0f, 1.0f});
+    XrVector3f x_col = v3_cross(ref_up_hint, z_col);
+    if (v3_len(x_col) < 1e-4f) {
+        x_col = v3_sub(fallback_right, v3_scale(z_col, v3_dot(fallback_right, z_col)));
+    }
+    x_col = v3_norm(x_col, {1.0f, 0.0f, 0.0f});
+    const XrVector3f y_col = v3_norm(v3_cross(z_col, x_col), {0.0f, 1.0f, 0.0f});
+    return quat_from_basis(x_col, y_col, z_col);
 }
 
 // Compact 5x7 uppercase/ASCII bitmap glyphs (A-Z, 0-9, punctuation) for the
@@ -186,12 +292,41 @@ void draw_hud_text(std::vector<uint8_t>& rgba, int w, int h, int x0, int y0,
     }
 }
 
+uint8_t premul_channel(uint8_t c, uint8_t a, bool srgb) {
+    if (a == 255) return c;
+    if (a == 0) return 0;
+    if (!srgb) {
+        return static_cast<uint8_t>((static_cast<uint32_t>(c) * a + 127u) / 255u);
+    }
+    static const std::array<uint8_t, 65536> kSrgbPremul = []() {
+        std::array<uint8_t, 65536> tbl{};
+        auto srgb_to_lin = [](double u) -> double {
+            return (u <= 0.04045) ? (u / 12.92) : std::pow((u + 0.055) / 1.055, 2.4);
+        };
+        auto lin_to_srgb = [](double l) -> double {
+            return (l <= 0.0031308) ? (12.92 * l) : (1.055 * std::pow(l, 1.0 / 2.4) - 0.055);
+        };
+        for (int av = 0; av < 256; ++av) {
+            const double af = static_cast<double>(av) / 255.0;
+            for (int cv = 0; cv < 256; ++cv) {
+                const double lin = srgb_to_lin(static_cast<double>(cv) / 255.0) * af;
+                const int enc = static_cast<int>(std::lround(std::clamp(lin_to_srgb(lin), 0.0, 1.0) * 255.0));
+                tbl[static_cast<size_t>(av) * 256u + static_cast<size_t>(cv)] =
+                    static_cast<uint8_t>(std::clamp(enc, 0, 255));
+            }
+        }
+        return tbl;
+    }();
+    return kSrgbPremul[static_cast<size_t>(a) * 256u + static_cast<size_t>(c)];
+}
+
 struct Backend {
     // GBA logical framebuffer size
     int base_w = 240;
     int base_h = 160;
     uint32_t swap_w = 960;
     uint32_t swap_h = 640;
+    bool swapchain_srgb = false;
     std::string title = "WarioWare: Twisted! VR";
 
     // Color LUT + CPU conversion staging buffers
@@ -217,9 +352,9 @@ struct Backend {
     XrSpace local_space = XR_NULL_HANDLE;
     XrSpace view_space = XR_NULL_HANDLE;
     XrSessionState session_state = XR_SESSION_STATE_UNKNOWN;
-    bool session_running = false;
-    bool exit_requested = false;
-    bool background_pending = false;
+    std::atomic<bool> session_running{false};
+    std::atomic<bool> exit_requested{false};
+    std::atomic<bool> background_pending{false};
 
     // Layered GBA swapchains & images (0 = Backdrop/2D composite, 1..4 = Priorities 3..0)
     XrSwapchain screen_swapchains[kLayeredPlaneCount] = {};
@@ -257,6 +392,8 @@ struct Backend {
     // Virtual screen placement in LOCAL space
     XrPosef screen_pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.45f}};
     bool pose_initialized = false;
+    XrTime recenter_after_time = 0;
+    int recenter_frames_remaining = 6;
     float screen_distance = 1.45f;
     float screen_width_m = 1.26f;
 
@@ -285,9 +422,51 @@ struct Backend {
     bool prev_l_menu_click = false;
     bool gyro_motion_logged = false;
 
+    // Two-handed grip window grab & move state
+    bool grip_move_active = false;
+    XrVector3f grip_start_grab_dir = {0.0f, 0.0f, -1.0f};
+    float grip_start_hand_dist = 0.40f;
+    XrVector3f grip_start_screen_offset = {0.0f, 0.0f, -1.45f};
+    float grip_start_screen_dist = 1.45f;
+    XrVector3f grip_start_screen_up = {0.0f, 1.0f, 0.0f};
+    XrVector3f grip_start_screen_right = {1.0f, 0.0f, 0.0f};
+    XrVector3f grip_start_hand_right = {1.0f, 0.0f, 0.0f};
+
     // Cartridge rumble state
     bool rumble_active = false;
     std::chrono::steady_clock::time_point last_rumble_refresh{};
+
+    // Dedicated OpenXR compositor thread + frame staging
+    std::thread xr_thread;
+    std::atomic<bool> xr_thread_stop{false};
+    std::mutex init_mtx;
+    std::condition_variable init_cv;
+    bool init_done = false;
+    bool init_ok = false;
+
+    std::mutex frame_mtx;
+    std::vector<uint8_t> staging_pixels;
+    std::vector<uint8_t> xr_pixels;
+    unsigned staging_w = 0;
+    unsigned staging_h = 0;
+    unsigned staging_planes = 1;
+    bool staging_is_rgba = false;
+    uint64_t pending_seq = 0;
+    unsigned xr_w = 0;
+    unsigned xr_h = 0;
+    unsigned xr_planes = 1;
+    bool xr_is_rgba = false;
+    uint64_t uploaded_seq = 0;
+    bool force_reblit = false;
+
+    std::atomic<uint16_t> latest_keyinput{0x03FFu};
+    std::atomic<float> latest_gyro_rate_z{0.0f};
+
+    std::mutex haptic_mtx;
+    bool haptic_pulse_queued = false;
+    XrDuration queued_haptic_ns = 0;
+    float queued_haptic_amp = 0.0f;
+    bool desired_rumble = false;
 
     // SDL audio (OpenSL ES / AAudio)
     SDL_AudioDeviceID audio_dev = 0;
@@ -421,6 +600,7 @@ bool create_swapchain_with_images(Backend& b, uint32_t w, uint32_t h,
     }
     if (!found_rgba8 && found_srgb) chosen = GL_SRGB8_ALPHA8;
     else if (!found_rgba8 && !formats.empty()) chosen = formats[0];
+    b.swapchain_srgb = (chosen == GL_SRGB8_ALPHA8);
 
     XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -551,24 +731,139 @@ void recenter_screen_to_head(Backend& b, XrTime time) {
         (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0) {
         return;
     }
-    const XrVector3f fwd = rotate_vec(loc.pose.orientation, 0.0f, 0.0f, -1.0f);
-    float fx = fwd.x;
-    float fz = fwd.z;
-    const float len = std::sqrt(fx * fx + fz * fz);
-    if (len < 1e-4f) {
-        fx = 0.0f;
-        fz = -1.0f;
-    } else {
-        fx /= len;
-        fz /= len;
+    const XrVector3f fwd = v3_norm(rotate_vec(loc.pose.orientation, 0.0f, 0.0f, -1.0f), {0.0f, 0.0f, -1.0f});
+    const XrVector3f head_up = v3_norm(rotate_vec(loc.pose.orientation, 0.0f, 1.0f, 0.0f), {0.0f, 1.0f, 0.0f});
+    const XrVector3f head_right = v3_norm(rotate_vec(loc.pose.orientation, 1.0f, 0.0f, 0.0f), {1.0f, 0.0f, 0.0f});
+
+    // Place screen along full 3D gaze vector so reclining / laying down looking at the ceiling
+    // places the window directly overhead in front of the player's eyes.
+    const XrVector3f offset = v3_sub(v3_scale(fwd, b.screen_distance), v3_scale(head_up, 0.04f));
+    b.screen_pose.position = v3_add(loc.pose.position, offset);
+
+    // When sitting/standing upright, keep the horizon level (world up = +Y).
+    // As the player reclines or lays down (looking steeply up/down or lying on their side),
+    // smoothly blend toward head_up so ceiling / side-lying play has zero gimbal twist.
+    const float pitch_upright = std::clamp((0.82f - std::abs(fwd.y)) / 0.25f, 0.0f, 1.0f);
+    const float roll_upright = std::clamp((head_up.y - 0.35f) / 0.35f, 0.0f, 1.0f);
+    const float upright_w = pitch_upright * roll_upright;
+    const XrVector3f world_up = {0.0f, 1.0f, 0.0f};
+    const XrVector3f ref_up = v3_norm(
+        v3_add(v3_scale(world_up, upright_w), v3_scale(head_up, 1.0f - upright_w)),
+        head_up);
+
+    b.screen_pose.orientation = make_screen_orientation(offset, ref_up, head_right);
+    b.pose_initialized = true;
+}
+
+void trigger_haptic_ns(Backend& b, int hand, XrDuration ns, float amplitude);
+
+void update_two_grip_window_move(Backend& b, XrTime time, bool both_grips, float stick_y) {
+    if (!both_grips) {
+        if (b.grip_move_active) {
+            b.grip_move_active = false;
+            trigger_haptic_ns(b, 0, 12000000LL, 0.20f);
+            trigger_haptic_ns(b, 1, 12000000LL, 0.20f);
+        }
+        return;
     }
-    b.screen_pose.position = {
-        loc.pose.position.x + fx * b.screen_distance,
-        loc.pose.position.y - 0.04f,
-        loc.pose.position.z + fz * b.screen_distance,
-    };
-    const float yaw = std::atan2(-fx, -fz);
-    b.screen_pose.orientation = {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+    if (b.view_space == XR_NULL_HANDLE || b.local_space == XR_NULL_HANDLE ||
+        b.aim_spaces[0] == XR_NULL_HANDLE || b.aim_spaces[1] == XR_NULL_HANDLE || time <= 0) {
+        return;
+    }
+
+    XrSpaceLocation head_loc{XR_TYPE_SPACE_LOCATION};
+    XrSpaceLocation l_loc{XR_TYPE_SPACE_LOCATION};
+    XrSpaceLocation r_loc{XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(xrLocateSpace(b.view_space, b.local_space, time, &head_loc)) ||
+        XR_FAILED(xrLocateSpace(b.aim_spaces[0], b.local_space, time, &l_loc)) ||
+        XR_FAILED(xrLocateSpace(b.aim_spaces[1], b.local_space, time, &r_loc))) {
+        return;
+    }
+    constexpr XrSpaceLocationFlags kNeedFlags =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    if ((head_loc.locationFlags & kNeedFlags) != kNeedFlags ||
+        (l_loc.locationFlags & kNeedFlags) != kNeedFlags ||
+        (r_loc.locationFlags & kNeedFlags) != kNeedFlags) {
+        return;
+    }
+
+    const XrVector3f head_pos = head_loc.pose.position;
+    const XrVector3f mid_pos = v3_scale(v3_add(l_loc.pose.position, r_loc.pose.position), 0.5f);
+    const XrVector3f aim_l = rotate_vec(l_loc.pose.orientation, 0.0f, 0.0f, -1.0f);
+    const XrVector3f aim_r = rotate_vec(r_loc.pose.orientation, 0.0f, 0.0f, -1.0f);
+    const XrVector3f mid_aim = v3_norm(v3_add(aim_l, aim_r), {0.0f, 0.0f, -1.0f});
+
+    // Virtual grab anchor sits slightly ahead of the two-hand midpoint along average controller aim,
+    // so both moving your hands and tilting your wrists smoothly swing the window anywhere (including overhead).
+    const XrVector3f grab_pt = v3_add(mid_pos, v3_scale(mid_aim, 0.38f));
+    const XrVector3f grab_vec = v3_sub(grab_pt, head_pos);
+    const float grab_len = std::max(0.10f, v3_len(grab_vec));
+    const XrVector3f grab_dir = v3_scale(grab_vec, 1.0f / grab_len);
+    const float hand_dist = std::max(0.10f, v3_len(v3_sub(mid_pos, head_pos)));
+    const XrVector3f hand_right = v3_norm(v3_sub(r_loc.pose.position, l_loc.pose.position),
+                                          rotate_vec(head_loc.pose.orientation, 1.0f, 0.0f, 0.0f));
+
+    if (!b.grip_move_active) {
+        b.grip_move_active = true;
+        b.grip_start_grab_dir = grab_dir;
+        b.grip_start_hand_dist = hand_dist;
+        b.grip_start_screen_offset = v3_sub(b.screen_pose.position, head_pos);
+        b.grip_start_screen_dist = std::clamp(v3_len(b.grip_start_screen_offset), 0.55f, 3.00f);
+        if (v3_len(b.grip_start_screen_offset) < 0.20f) {
+            b.grip_start_screen_offset = v3_scale(grab_dir, b.grip_start_screen_dist);
+        }
+        b.grip_start_screen_up = v3_norm(rotate_vec(b.screen_pose.orientation, 0.0f, 1.0f, 0.0f), {0.0f, 1.0f, 0.0f});
+        b.grip_start_screen_right = v3_norm(rotate_vec(b.screen_pose.orientation, 1.0f, 0.0f, 0.0f), {1.0f, 0.0f, 0.0f});
+        b.grip_start_hand_right = hand_right;
+        trigger_haptic_ns(b, 0, 18000000LL, 0.35f);
+        trigger_haptic_ns(b, 1, 18000000LL, 0.35f);
+        return;
+    }
+
+    // Allow thumbstick Y while holding both grips to smoothly push/pull the window distance
+    if (std::abs(stick_y) > kThumbstickDeadzone) {
+        b.grip_start_screen_dist = std::clamp(b.grip_start_screen_dist + stick_y * 0.018f, 0.55f, 3.00f);
+    }
+
+    const XrQuaternionf delta_rot = quat_from_two_unit_vecs(b.grip_start_grab_dir, grab_dir);
+    const XrVector3f orbited_dir = v3_norm(
+        rotate_vec(delta_rot, b.grip_start_screen_offset.x, b.grip_start_screen_offset.y, b.grip_start_screen_offset.z),
+        grab_dir);
+
+    const float dist_ratio = std::clamp(hand_dist / std::max(0.12f, b.grip_start_hand_dist), 0.50f, 2.00f);
+    const float new_dist = std::clamp(b.grip_start_screen_dist * dist_ratio, 0.55f, 3.00f);
+    b.screen_distance = new_dist;
+
+    const XrVector3f new_offset = v3_scale(orbited_dir, new_dist);
+    b.screen_pose.position = v3_add(head_pos, new_offset);
+
+    // Follow 3D orbit + two-hand roll delta so the player can tilt the window when lying on their side
+    const XrVector3f orbited_up = v3_norm(
+        rotate_vec(delta_rot, b.grip_start_screen_up.x, b.grip_start_screen_up.y, b.grip_start_screen_up.z),
+        {0.0f, 1.0f, 0.0f});
+    const XrVector3f orbited_right = v3_norm(
+        rotate_vec(delta_rot, b.grip_start_screen_right.x, b.grip_start_screen_right.y, b.grip_start_screen_right.z),
+        {1.0f, 0.0f, 0.0f});
+    const XrVector3f orbited_hand_right = v3_norm(
+        rotate_vec(delta_rot, b.grip_start_hand_right.x, b.grip_start_hand_right.y, b.grip_start_hand_right.z),
+        orbited_right);
+    const XrQuaternionf roll_rot = quat_from_two_unit_vecs(orbited_hand_right, hand_right);
+    const XrVector3f rolled_up = v3_norm(
+        rotate_vec(roll_rot, orbited_up.x, orbited_up.y, orbited_up.z),
+        orbited_up);
+
+    // When mostly upright and hands are level, gently stabilize horizon; when overhead/tilted, follow full 3D pose
+    const XrVector3f head_up = v3_norm(rotate_vec(head_loc.pose.orientation, 0.0f, 1.0f, 0.0f), {0.0f, 1.0f, 0.0f});
+    const float pitch_upright = std::clamp((0.78f - std::abs(orbited_dir.y)) / 0.25f, 0.0f, 1.0f);
+    const float roll_upright = std::clamp((head_up.y - 0.45f) / 0.35f, 0.0f, 1.0f);
+    const float level_hand = std::clamp((0.25f - std::abs(hand_right.y)) / 0.20f, 0.0f, 1.0f);
+    const float world_w = pitch_upright * roll_upright * level_hand * 0.65f;
+    const XrVector3f world_up = {0.0f, 1.0f, 0.0f};
+    const XrVector3f ref_up = v3_norm(
+        v3_add(v3_scale(world_up, world_w), v3_scale(rolled_up, 1.0f - world_w)),
+        rolled_up);
+
+    b.screen_pose.orientation = make_screen_orientation(new_offset, ref_up, orbited_right);
     b.pose_initialized = true;
 }
 
@@ -619,9 +914,18 @@ void upload_hud_image(Backend& b) {
                   (b.passthrough_supported && b.passthrough_active) ? "ON" : "OFF");
     draw_hud_text(rgba, kHudWidth, kHudHeight, 14, 10, 2, 0xFAD23CFFu, line1);
     draw_hud_text(rgba, kHudWidth, kHudHeight, 14, 34, 2, 0xFFFFFFFFu,
-                  "TWIST: GYRO  A/RT: A  B: B  GRIPS/LT: R/L  L+R-CLK: 3D DEPTH");
+                  "TWIST: GYRO  A/RT: A  B: B  L+R GRIP: MOVE WIN  L+R-CLK: 3D");
     draw_hud_text(rgba, kHudWidth, kHudHeight, 14, 58, 2, 0xB8C4E0FFu,
                   "STICK: DPAD  X/Y: START/SEL  R-CLK: CENTER  L-CLK: HAND  MENU: MR");
+
+    for (size_t i = 0; i < rgba.size(); i += 4) {
+        const uint8_t a = rgba[i + 3];
+        if (a < 255) {
+            rgba[i + 0] = premul_channel(rgba[i + 0], a, b.swapchain_srgb);
+            rgba[i + 1] = premul_channel(rgba[i + 1], a, b.swapchain_srgb);
+            rgba[i + 2] = premul_channel(rgba[i + 2], a, b.swapchain_srgb);
+        }
+    }
 
     glBindTexture(GL_TEXTURE_2D, b.hud_images[img_idx].image);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kHudWidth, kHudHeight,
@@ -683,6 +987,17 @@ void handle_xr_events(Backend& b) {
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
                 b.exit_requested = true;
                 break;
+            case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
+                const auto* rsc =
+                    reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&ev);
+                XR_LOGI("OpenXR reference space change pending (space=%d, changeTime=%lld) -> recentering screen",
+                        static_cast<int>(rsc->referenceSpaceType),
+                        static_cast<long long>(rsc->changeTime));
+                b.pose_initialized = false;
+                b.recenter_after_time = rsc->changeTime;
+                b.recenter_frames_remaining = 6;
+                break;
+            }
             case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
                 const auto* ssc = reinterpret_cast<const XrEventDataSessionStateChanged*>(&ev);
                 b.session_state = ssc->state;
@@ -692,6 +1007,9 @@ void handle_xr_events(Backend& b) {
                     sbi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     if (XR_SUCCEEDED(xrBeginSession(b.session, &sbi))) {
                         b.session_running = true;
+                        b.pose_initialized = false;
+                        b.recenter_after_time = 0;
+                        b.recenter_frames_remaining = 6;
                         apply_passthrough_state(b);
                         XR_LOGI("xrBeginSession succeeded");
                     } else {
@@ -991,22 +1309,32 @@ bool blit_rgba_to_swapchain(Backend& b, unsigned plane_idx, int iw, int ih,
 }
 
 void flip_and_grade_rgba_plane(Backend& b, const uint8_t* plane_rgba, int iw, int ih,
-                               bool* out_has_opaque) {
+                               bool* out_has_opaque, bool premultiply = true) {
     const size_t px_count = static_cast<size_t>(iw) * ih;
+    b.rgba_fb.resize(px_count * 4);
     const bool use_lut = (b.color_lut && !b.color_lut->is_passthrough());
-    const uint8_t* rgb_src = nullptr;
+    size_t vis_count = 0;
     if (use_lut) {
-        b.color_lut_rgb.resize(px_count * 3);
-        b.graded_fb.resize(px_count * 3);
+        b.color_lut_rgb.clear();
         for (size_t i = 0; i < px_count; ++i) {
-            b.color_lut_rgb[i * 3 + 0] = plane_rgba[i * 4 + 0];
-            b.color_lut_rgb[i * 3 + 1] = plane_rgba[i * 4 + 1];
-            b.color_lut_rgb[i * 3 + 2] = plane_rgba[i * 4 + 2];
+            const uint8_t a = plane_rgba[i * 4 + 3];
+            if (a == 0) continue;
+            b.color_lut_rgb.push_back(plane_rgba[i * 4 + 0]);
+            b.color_lut_rgb.push_back(plane_rgba[i * 4 + 1]);
+            b.color_lut_rgb.push_back(plane_rgba[i * 4 + 2]);
+            ++vis_count;
         }
-        b.color_lut->map_rgb888(b.color_lut_rgb.data(), b.graded_fb.data(), iw, ih);
-        rgb_src = b.graded_fb.data();
+        if (vis_count == 0) {
+            if (out_has_opaque) *out_has_opaque = false;
+            return;
+        }
+        b.graded_fb.resize(vis_count * 3);
+        b.color_lut->map_rgb888(b.color_lut_rgb.data(), b.graded_fb.data(),
+                                static_cast<int>(vis_count), 1);
     }
 
+    const uint8_t* graded_ptr = use_lut ? b.graded_fb.data() : nullptr;
+    size_t graded_idx = 0;
     bool any_visible = false;
     for (int y = 0; y < ih; ++y) {
         const size_t in_row_px = static_cast<size_t>(y) * iw;
@@ -1015,41 +1343,248 @@ void flip_and_grade_rgba_plane(Backend& b, const uint8_t* plane_rgba, int iw, in
         for (int x = 0; x < iw; ++x) {
             const size_t p_off = (in_row_px + x) * 4;
             const uint8_t a = plane_rgba[p_off + 3];
-            if (a != 0) any_visible = true;
-            if (rgb_src) {
-                const size_t g_off = (in_row_px + x) * 3;
-                out_row[x * 4 + 0] = rgb_src[g_off + 0];
-                out_row[x * 4 + 1] = rgb_src[g_off + 1];
-                out_row[x * 4 + 2] = rgb_src[g_off + 2];
-            } else {
-                out_row[x * 4 + 0] = plane_rgba[p_off + 0];
-                out_row[x * 4 + 1] = plane_rgba[p_off + 1];
-                out_row[x * 4 + 2] = plane_rgba[p_off + 2];
+            if (a == 0) {
+                out_row[x * 4 + 0] = 0;
+                out_row[x * 4 + 1] = 0;
+                out_row[x * 4 + 2] = 0;
+                out_row[x * 4 + 3] = 0;
+                continue;
             }
+            any_visible = true;
+            uint8_t r = graded_ptr ? graded_ptr[graded_idx * 3 + 0] : plane_rgba[p_off + 0];
+            uint8_t g = graded_ptr ? graded_ptr[graded_idx * 3 + 1] : plane_rgba[p_off + 1];
+            uint8_t bl = graded_ptr ? graded_ptr[graded_idx * 3 + 2] : plane_rgba[p_off + 2];
+            if (graded_ptr) ++graded_idx;
+            if (premultiply && a < 255) {
+                r = premul_channel(r, a, b.swapchain_srgb);
+                g = premul_channel(g, a, b.swapchain_srgb);
+                bl = premul_channel(bl, a, b.swapchain_srgb);
+            }
+            out_row[x * 4 + 0] = r;
+            out_row[x * 4 + 1] = g;
+            out_row[x * 4 + 2] = bl;
             out_row[x * 4 + 3] = a;
         }
     }
     if (out_has_opaque) *out_has_opaque = any_visible;
 }
 
-void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigned src_h,
-                  unsigned plane_count = 1, bool is_rgba_planes = false) {
-    if (b.session == XR_NULL_HANDLE || !b.session_running) return;
-    if (b.egl_display != EGL_NO_DISPLAY) {
-        eglMakeCurrent(b.egl_display, b.egl_surface, b.egl_surface, b.egl_context);
+void poll_xr_actions(Backend& b) {
+    if (!b.actions_attached || b.session_state != XR_SESSION_STATE_FOCUSED) {
+        b.latest_keyinput.store(0x03FFu, std::memory_order_release);
+        b.latest_gyro_rate_z.store(0.0f, std::memory_order_release);
+        return;
     }
+
+    XrActiveActionSet active{b.action_set, XR_NULL_PATH};
+    XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+    sync.countActiveActionSets = 1;
+    sync.activeActionSets = &active;
+    if (XR_FAILED(xrSyncActions(b.session, &sync))) {
+        return;
+    }
+
+    auto read_bool = [&](XrAction action, XrPath sub = XR_NULL_PATH) -> bool {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = action;
+        gi.subactionPath = sub;
+        XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (XR_SUCCEEDED(xrGetActionStateBoolean(b.session, &gi, &st)) &&
+            st.isActive && st.currentState) {
+            return true;
+        }
+        return false;
+    };
+    auto read_float = [&](XrAction action, XrPath sub) -> float {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = action;
+        gi.subactionPath = sub;
+        XrActionStateFloat st{XR_TYPE_ACTION_STATE_FLOAT};
+        if (XR_SUCCEEDED(xrGetActionStateFloat(b.session, &gi, &st)) && st.isActive) {
+            return st.currentState;
+        }
+        return 0.0f;
+    };
+    auto read_vec2 = [&](XrAction action, XrPath sub) -> XrVector2f {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = action;
+        gi.subactionPath = sub;
+        XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
+        if (XR_SUCCEEDED(xrGetActionStateVector2f(b.session, &gi, &st)) && st.isActive) {
+            return st.currentState;
+        }
+        return {0.0f, 0.0f};
+    };
+
+    const XrVector2f lstick = read_vec2(b.act_thumbstick, b.hand_paths[0]);
+    const XrVector2f rstick = read_vec2(b.act_thumbstick, b.hand_paths[1]);
+    const float ltrig = read_float(b.act_trigger, b.hand_paths[0]);
+    const float rtrig = read_float(b.act_trigger, b.hand_paths[1]);
+    const float lgrip = read_float(b.act_squeeze, b.hand_paths[0]);
+    const float rgrip = read_float(b.act_squeeze, b.hand_paths[1]);
+    const bool btn_a = read_bool(b.act_a);
+    const bool btn_b = read_bool(b.act_b);
+    const bool btn_x = read_bool(b.act_x);
+    const bool btn_y = read_bool(b.act_y);
+    const bool l_click = read_bool(b.act_thumb_click, b.hand_paths[0]);
+    const bool r_click = read_bool(b.act_thumb_click, b.hand_paths[1]);
+    const bool l_menu = read_bool(b.act_menu);
+
+    const bool both_grips = (lgrip > kGripThreshold) && (rgrip > kGripThreshold);
+    const XrTime pose_time = b.last_predicted_time > 0 ? b.last_predicted_time : 1;
+    const float max_stick_y = (std::abs(lstick.y) > std::abs(rstick.y)) ? lstick.y : rstick.y;
+    update_two_grip_window_move(b, pose_time, both_grips, max_stick_y);
+
+    // GBA KEYINPUT active-low: 0=A 1=B 2=Sel 3=Sta 4=Right 5=Left 6=Up 7=Down 8=R 9=L
+    uint16_t keys = 0x03FFu;
+    if (btn_a || rtrig > kTriggerThreshold) keys &= ~(1u << 0);
+    if (btn_b)                              keys &= ~(1u << 1);
+    if (btn_y)                              keys &= ~(1u << 2);
+    if (btn_x)                              keys &= ~(1u << 3);
+    if (!both_grips) {
+        if (lstick.x > kThumbstickDeadzone || rstick.x > kThumbstickDeadzone)   keys &= ~(1u << 4);
+        if (lstick.x < -kThumbstickDeadzone || rstick.x < -kThumbstickDeadzone) keys &= ~(1u << 5);
+        if (lstick.y > kThumbstickDeadzone || rstick.y > kThumbstickDeadzone)   keys &= ~(1u << 6);
+        if (lstick.y < -kThumbstickDeadzone || rstick.y < -kThumbstickDeadzone) keys &= ~(1u << 7);
+        if (rgrip > kGripThreshold)                                              keys &= ~(1u << 8);
+        if (ltrig > kTriggerThreshold || lgrip > kGripThreshold)                 keys &= ~(1u << 9);
+    } else if (ltrig > kTriggerThreshold) {
+        keys &= ~(1u << 9);
+    }
+    b.latest_keyinput.store(keys, std::memory_order_release);
+
+    const bool both_clicks = l_click && r_click;
+    if (both_clicks && !b.prev_both_stick_clicks) {
+        b.depth_mode = (b.depth_mode + 1) % 3;
+        b.stick_chord_consumed = true;
+        b.hud_dirty = true;
+        b.force_reblit = true;
+        trigger_haptic_ns(b, 0, 25000000LL, 0.45f);
+        trigger_haptic_ns(b, 1, 25000000LL, 0.45f);
+        XR_LOGI("3D Layered Depth mode -> %d (step=%.2fm)",
+                b.depth_mode, static_cast<double>(depth_step_meters(b.depth_mode)));
+    }
+    b.prev_both_stick_clicks = both_clicks;
+
+    if (!l_click && !r_click) {
+        if (!b.stick_chord_consumed) {
+            if (b.prev_r_stick_click) {
+                recenter_screen_to_head(b, pose_time);
+                trigger_haptic_ns(b, 1, 20000000LL, 0.35f);
+            } else if (b.prev_l_stick_click) {
+                b.active_gyro_hand = 1 - b.active_gyro_hand;
+                b.hud_dirty = true;
+                trigger_haptic_ns(b, b.active_gyro_hand, 30000000LL, 0.5f);
+                XR_LOGI("Active gyro controller -> %s",
+                        b.active_gyro_hand == 1 ? "RIGHT" : "LEFT");
+            }
+        }
+        b.stick_chord_consumed = false;
+    }
+    b.prev_r_stick_click = r_click;
+    b.prev_l_stick_click = l_click;
+
+    if (l_menu && !b.prev_l_menu_click) {
+        if (b.passthrough_supported) {
+            b.hud_mode = (b.hud_mode + 1) % 3;
+            b.passthrough_active = (b.hud_mode != 2);
+            apply_passthrough_state(b);
+        } else {
+            b.hud_mode = (b.hud_mode == 0) ? 1 : 0;
+        }
+        b.hud_dirty = true;
+        trigger_haptic_ns(b, 0, 20000000LL, 0.35f);
+    }
+    b.prev_l_menu_click = l_menu;
+
+    XrSpaceVelocity vel{XR_TYPE_SPACE_VELOCITY};
+    XrSpaceLocation hand_loc{XR_TYPE_SPACE_LOCATION, &vel};
+    const XrSpace active_space = b.aim_spaces[b.active_gyro_hand];
+    if (!both_grips && active_space != XR_NULL_HANDLE &&
+        XR_SUCCEEDED(xrLocateSpace(active_space, b.local_space, pose_time, &hand_loc)) &&
+        (hand_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+        (vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)) {
+        // Forearm pronation/supination axis in controller aim space (tilted slightly toward handle
+        // so twisting works naturally whether pointing at the screen, resting arm on bed while laying
+        // down, or holding controller upright) + screen-normal projection for flat steering twists.
+        const XrVector3f wrist_axis = v3_norm(
+            rotate_vec(hand_loc.pose.orientation, 0.0f, -0.26f, 0.965f),
+            {0.0f, 0.0f, 1.0f});
+        const XrVector3f screen_normal = v3_norm(
+            rotate_vec(b.screen_pose.orientation, 0.0f, 0.0f, 1.0f),
+            wrist_axis);
+        const float rate_wrist = v3_dot(vel.angularVelocity, wrist_axis);
+        const float rate_screen = v3_dot(vel.angularVelocity, screen_normal);
+        const float rate_z = (std::abs(rate_wrist) >= std::abs(rate_screen) * 0.75f)
+                                 ? rate_wrist
+                                 : rate_screen;
+        const float filtered = (std::abs(rate_z) >= kGyroDriftDeadzoneRadPerSec) ? rate_z : 0.0f;
+        b.latest_gyro_rate_z.store(filtered * kQuestGyroRateScale, std::memory_order_release);
+        if (filtered != 0.0f && !b.gyro_motion_logged) {
+            XR_LOGI("Quest Touch Plus gyro active: hand=%s rate_z=%.3f rad/s",
+                    b.active_gyro_hand == 1 ? "RIGHT" : "LEFT",
+                    static_cast<double>(rate_z));
+            b.gyro_motion_logged = true;
+        }
+    } else {
+        b.latest_gyro_rate_z.store(0.0f, std::memory_order_release);
+    }
+}
+
+void process_pending_haptics(Backend& b) {
+    bool pulse = false;
+    XrDuration pulse_ns = 0;
+    float pulse_amp = 0.0f;
+    bool rumble = false;
+    {
+        std::lock_guard<std::mutex> lk(b.haptic_mtx);
+        if (b.haptic_pulse_queued) {
+            pulse = true;
+            pulse_ns = b.queued_haptic_ns;
+            pulse_amp = b.queued_haptic_amp;
+            b.haptic_pulse_queued = false;
+        }
+        rumble = b.desired_rumble;
+    }
+    if (pulse) {
+        trigger_haptic_ns(b, b.active_gyro_hand, pulse_ns, pulse_amp);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (rumble) {
+        if (!b.rumble_active ||
+            (now - b.last_rumble_refresh) >= std::chrono::milliseconds(22)) {
+            trigger_haptic_ns(b, b.active_gyro_hand, 40000000LL, 0.70f);
+            b.last_rumble_refresh = now;
+        }
+        b.rumble_active = true;
+    } else if (b.rumble_active) {
+        stop_haptic(b, b.active_gyro_hand);
+        b.rumble_active = false;
+    }
+}
+
+void render_xr_frame(Backend& b) {
+    if (b.session == XR_NULL_HANDLE || !b.session_running.load(std::memory_order_acquire)) return;
 
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     if (XR_FAILED(xrWaitFrame(b.session, &wait_info, &frame_state))) return;
     b.last_predicted_time = frame_state.predictedDisplayTime;
 
-    if (!b.pose_initialized && b.session_state >= XR_SESSION_STATE_SYNCHRONIZED) {
+    if (b.session_state == XR_SESSION_STATE_FOCUSED &&
+        (!b.pose_initialized || b.recenter_frames_remaining > 0) &&
+        frame_state.predictedDisplayTime >= b.recenter_after_time) {
         recenter_screen_to_head(b, frame_state.predictedDisplayTime);
+        if (b.pose_initialized && b.recenter_frames_remaining > 0) {
+            --b.recenter_frames_remaining;
+        }
     }
 
     XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
     if (XR_FAILED(xrBeginFrame(b.session, &begin_info))) return;
+
+    poll_xr_actions(b);
+    process_pending_haptics(b);
 
     std::vector<const XrCompositionLayerBaseHeader*> layers;
     XrCompositionLayerPassthroughFB pt_layer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
@@ -1058,6 +1593,29 @@ void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigne
     XrCompositionLayerQuad hud_quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
 
     if (frame_state.shouldRender) {
+        bool do_blit = false;
+        {
+            std::lock_guard<std::mutex> lk(b.frame_mtx);
+            if (b.pending_seq != b.uploaded_seq && !b.staging_pixels.empty()) {
+                b.xr_pixels.swap(b.staging_pixels);
+                b.xr_w = b.staging_w;
+                b.xr_h = b.staging_h;
+                b.xr_planes = b.staging_planes;
+                b.xr_is_rgba = b.staging_is_rgba;
+                b.uploaded_seq = b.pending_seq;
+                do_blit = true;
+            }
+        }
+        if (b.force_reblit && !b.xr_pixels.empty()) {
+            do_blit = true;
+            b.force_reblit = false;
+        }
+        const uint8_t* src_pixels = do_blit ? b.xr_pixels.data() : nullptr;
+        const unsigned src_w = b.xr_w;
+        const unsigned src_h = b.xr_h;
+        const unsigned plane_count = b.xr_planes;
+        const bool is_rgba_planes = b.xr_is_rgba;
+
         if (src_pixels && src_w > 0 && src_h > 0) {
             const int iw = static_cast<int>(src_w);
             const int ih = static_cast<int>(src_h);
@@ -1096,7 +1654,7 @@ void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigne
                             }
                         }
                     }
-                    flip_and_grade_rgba_plane(b, b.rgba_composite_fb.data(), iw, ih, nullptr);
+                    flip_and_grade_rgba_plane(b, b.rgba_composite_fb.data(), iw, ih, nullptr, false);
                     if (blit_rgba_to_swapchain(b, 0, iw, ih, b.rgba_fb.data(), false)) {
                         glFlush();
                         b.active_planes[0] = true;
@@ -1113,7 +1671,7 @@ void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigne
                         }
                         bool has_visible = false;
                         flip_and_grade_rgba_plane(b, src_pixels + p * plane_bytes, iw, ih,
-                                                  &has_visible);
+                                                  &has_visible, p > 0);
                         if (p == 0) has_visible = true; // Backdrop plane always submitted
                         if (!has_visible) {
                             b.active_planes[p] = false;
@@ -1186,8 +1744,7 @@ void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigne
                     XrCompositionLayerQuad& q = screen_quads[p];
                     q.layerFlags = (p == 0)
                                        ? 0
-                                       : (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                                          XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT);
+                                       : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                     q.space = b.local_space;
                     q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                     q.subImage.swapchain = b.screen_swapchains[p];
@@ -1228,8 +1785,7 @@ void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigne
                 const XrVector3f up_off = rotate_vec(b.screen_pose.orientation, 0.0f,
                                                      -(screen_h * 0.5f + hud_h * 0.5f + 0.06f),
                                                      0.05f);
-                hud_quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                                      XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+                hud_quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                 hud_quad.space = b.local_space;
                 hud_quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                 hud_quad.subImage.swapchain = b.hud_swapchain;
@@ -1259,6 +1815,61 @@ void submit_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigne
             XR_LOGW("xrEndFrame failed: %d (layers=%u)", eres, end_info.layerCount);
             s_logged = true;
         }
+    }
+}
+
+void stage_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigned src_h,
+                 unsigned plane_count, bool is_rgba_planes) {
+    if (!src_pixels || src_w == 0 || src_h == 0) return;
+    const size_t bytes = is_rgba_planes
+                             ? (static_cast<size_t>(src_w) * src_h * 4 * plane_count)
+                             : (static_cast<size_t>(src_w) * src_h * 3);
+    std::lock_guard<std::mutex> lk(b.frame_mtx);
+    b.staging_pixels.assign(src_pixels, src_pixels + bytes);
+    b.staging_w = src_w;
+    b.staging_h = src_h;
+    b.staging_planes = plane_count;
+    b.staging_is_rgba = is_rgba_planes;
+    ++b.pending_seq;
+}
+
+void xr_thread_main(Backend* b_ptr) {
+    Backend& b = *b_ptr;
+    JavaVM* vm = nullptr;
+    if (JNIEnv* main_env = static_cast<JNIEnv*>(SDL_AndroidGetJNIEnv())) {
+        main_env->GetJavaVM(&vm);
+    }
+    JNIEnv* thread_env = nullptr;
+    if (vm) {
+        JavaVMAttachArgs args{JNI_VERSION_1_6, "WarioWareXRThread", nullptr};
+        vm->AttachCurrentThread(&thread_env, &args);
+    }
+
+    const bool ok = init_egl(b) && init_openxr(b);
+    {
+        std::lock_guard<std::mutex> lk(b.init_mtx);
+        b.init_ok = ok;
+        b.init_done = true;
+    }
+    b.init_cv.notify_all();
+
+    if (ok) {
+        while (!b.xr_thread_stop.load(std::memory_order_acquire) &&
+               !b.exit_requested.load(std::memory_order_acquire)) {
+            handle_xr_events(b);
+            if (b.exit_requested.load(std::memory_order_acquire)) break;
+            if (b.session_running.load(std::memory_order_acquire)) {
+                render_xr_frame(b);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            }
+        }
+    }
+
+    shutdown_openxr(b);
+    shutdown_egl(b);
+    if (vm && thread_env) {
+        vm->DetachCurrentThread();
     }
 }
 
@@ -1305,9 +1916,14 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     b->linear_filter = linear_filter;
     b->color_lut = std::make_unique<runtime::ColorLut>(parse_color_settings(screen));
 
-    if (!init_egl(*b) || !init_openxr(*b)) {
-        shutdown_openxr(*b);
-        shutdown_egl(*b);
+    b->xr_thread = std::thread(xr_thread_main, b.get());
+    {
+        std::unique_lock<std::mutex> lk(b->init_mtx);
+        b->init_cv.wait(lk, [&]() { return b->init_done; });
+    }
+    if (!b->init_ok) {
+        b->xr_thread_stop.store(true, std::memory_order_release);
+        if (b->xr_thread.joinable()) b->xr_thread.join();
         return false;
     }
     init_sdl_audio(*b);
@@ -1325,6 +1941,10 @@ void HostWindow::close() {
         return;
     }
     auto* b = as_backend(impl_);
+    b->xr_thread_stop.store(true, std::memory_order_release);
+    if (b->xr_thread.joinable()) {
+        b->xr_thread.join();
+    }
     if (b->audio_dev != 0) {
         SDL_CloseAudioDevice(b->audio_dev);
         b->audio_dev = 0;
@@ -1333,8 +1953,6 @@ void HostWindow::close() {
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
         b->sdl_audio_init = false;
     }
-    shutdown_openxr(*b);
-    shutdown_egl(*b);
     delete b;
     impl_ = nullptr;
     open_ = false;
@@ -1428,42 +2046,34 @@ bool HostWindow::wait_for_foreground() {
         SDL_ClearQueuedAudio(b->audio_dev);
         b->audio_direct_started = false;
     }
-    while (!b->exit_requested && !b->session_running) {
-        handle_xr_events(*b);
+    while (!b->exit_requested.load(std::memory_order_acquire) &&
+           !b->session_running.load(std::memory_order_acquire)) {
         SDL_Event sev;
         while (SDL_PollEvent(&sev)) {
             if (sev.type == SDL_QUIT || sev.type == SDL_APP_TERMINATING) {
-                b->exit_requested = true;
+                b->exit_requested.store(true, std::memory_order_release);
             }
         }
-        if (b->exit_requested) return false;
+        if (b->exit_requested.load(std::memory_order_acquire)) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
     }
-    return !b->exit_requested;
+    return !b->exit_requested.load(std::memory_order_acquire);
 }
 
 void HostWindow::haptic_pulse(int duration_ms, float strength) {
     if (!open_ || !impl_ || duration_ms <= 0 || strength <= 0.0f) return;
     auto* b = as_backend(impl_);
-    const XrDuration ns = static_cast<XrDuration>(std::clamp(duration_ms, 1, 2000)) * 1000000LL;
-    trigger_haptic_ns(*b, b->active_gyro_hand, ns, strength);
+    std::lock_guard<std::mutex> lk(b->haptic_mtx);
+    b->queued_haptic_ns = static_cast<XrDuration>(std::clamp(duration_ms, 1, 2000)) * 1000000LL;
+    b->queued_haptic_amp = strength;
+    b->haptic_pulse_queued = true;
 }
 
 void HostWindow::set_rumble(bool on) {
     if (!open_ || !impl_) return;
     auto* b = as_backend(impl_);
-    const auto now = std::chrono::steady_clock::now();
-    if (on) {
-        if (!b->rumble_active ||
-            (now - b->last_rumble_refresh) >= std::chrono::milliseconds(22)) {
-            trigger_haptic_ns(*b, b->active_gyro_hand, 40000000LL, 0.70f);
-            b->last_rumble_refresh = now;
-        }
-        b->rumble_active = true;
-    } else if (b->rumble_active) {
-        stop_haptic(*b, b->active_gyro_hand);
-        b->rumble_active = false;
-    }
+    std::lock_guard<std::mutex> lk(b->haptic_mtx);
+    b->desired_rumble = on;
 }
 
 void HostWindow::set_fps_readout(bool on) {
@@ -1482,20 +2092,20 @@ int HostWindow::fast_forward_multiplier() const {
 void HostWindow::present(const uint8_t* rgb888) {
     if (!open_ || !impl_) return;
     auto* b = as_backend(impl_);
-    submit_frame(*b, rgb888, static_cast<unsigned>(b->base_w), static_cast<unsigned>(b->base_h));
+    stage_frame(*b, rgb888, static_cast<unsigned>(b->base_w), static_cast<unsigned>(b->base_h), 1, false);
 }
 
 void HostWindow::present(const uint8_t* rgb888, unsigned sampled_w, unsigned sampled_h) {
     if (!open_ || !impl_) return;
     auto* b = as_backend(impl_);
-    submit_frame(*b, rgb888, sampled_w, sampled_h, 1, false);
+    stage_frame(*b, rgb888, sampled_w, sampled_h, 1, false);
 }
 
 void HostWindow::present_layered_3d(const uint8_t* planes_rgba, unsigned width,
                                       unsigned height, unsigned plane_count) {
     if (!open_ || !impl_) return;
     auto* b = as_backend(impl_);
-    submit_frame(*b, planes_rgba, width, height, plane_count, true);
+    stage_frame(*b, planes_rgba, width, height, plane_count, true);
 }
 
 void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
@@ -1525,10 +2135,7 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     }
 }
 
-void HostWindow::service_events() {
-    if (!open_ || !impl_) return;
-    handle_xr_events(*as_backend(impl_));
-}
+void HostWindow::service_events() {}
 
 HostWindow::Events HostWindow::pump() {
     Events ev;
@@ -1537,189 +2144,31 @@ HostWindow::Events HostWindow::pump() {
         return ev;
     }
     auto* b = as_backend(impl_);
-    handle_xr_events(*b);
 
-    if (b->background_pending) {
+    if (b->background_pending.exchange(false, std::memory_order_acq_rel)) {
         ev.enter_background = true;
-        b->background_pending = false;
     }
 
     SDL_Event sev;
     while (SDL_PollEvent(&sev)) {
         if (sev.type == SDL_QUIT) {
-            b->exit_requested = true;
+            b->exit_requested.store(true, std::memory_order_release);
         } else if (sev.type == SDL_APP_WILLENTERBACKGROUND ||
                    sev.type == SDL_APP_DIDENTERBACKGROUND) {
             ev.enter_background = true;
         } else if (sev.type == SDL_APP_TERMINATING) {
             ev.terminating = true;
-            b->exit_requested = true;
+            b->exit_requested.store(true, std::memory_order_release);
         }
     }
 
-    // Wait briefly until OpenXR enters READY/running at startup so we can bind
-    // controllers and start receiving frames cleanly without spinning blind.
-    if (!b->session_running && !b->exit_requested &&
-        b->session_state != XR_SESSION_STATE_STOPPING) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        handle_xr_events(*b);
-    }
-
-    if (b->exit_requested) {
+    if (b->exit_requested.load(std::memory_order_acquire)) {
         ev.quit = true;
         return ev;
     }
 
-    // Advance XR session frame if running and we haven't had a present() yet
-    // (e.g. during initial boot/menus or runtime pauses) so compositor & pose
-    // timestamps stay fresh.
-    if (b->session_running && !b->has_submitted_frame) {
-        submit_frame(*b, nullptr, 0, 0);
-    }
-
-    if (!b->actions_attached || b->session_state != XR_SESSION_STATE_FOCUSED) {
-        return ev;
-    }
-
-    XrActiveActionSet active{b->action_set, XR_NULL_PATH};
-    XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
-    sync.countActiveActionSets = 1;
-    sync.activeActionSets = &active;
-    if (XR_FAILED(xrSyncActions(b->session, &sync))) {
-        return ev;
-    }
-
-    auto read_bool = [&](XrAction action, XrPath sub = XR_NULL_PATH) -> bool {
-        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
-        gi.action = action;
-        gi.subactionPath = sub;
-        XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
-        if (XR_SUCCEEDED(xrGetActionStateBoolean(b->session, &gi, &st)) &&
-            st.isActive && st.currentState) {
-            return true;
-        }
-        return false;
-    };
-    auto read_float = [&](XrAction action, XrPath sub) -> float {
-        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
-        gi.action = action;
-        gi.subactionPath = sub;
-        XrActionStateFloat st{XR_TYPE_ACTION_STATE_FLOAT};
-        if (XR_SUCCEEDED(xrGetActionStateFloat(b->session, &gi, &st)) && st.isActive) {
-            return st.currentState;
-        }
-        return 0.0f;
-    };
-    auto read_vec2 = [&](XrAction action, XrPath sub) -> XrVector2f {
-        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
-        gi.action = action;
-        gi.subactionPath = sub;
-        XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
-        if (XR_SUCCEEDED(xrGetActionStateVector2f(b->session, &gi, &st)) && st.isActive) {
-            return st.currentState;
-        }
-        return {0.0f, 0.0f};
-    };
-
-    const XrVector2f lstick = read_vec2(b->act_thumbstick, b->hand_paths[0]);
-    const XrVector2f rstick = read_vec2(b->act_thumbstick, b->hand_paths[1]);
-    const float ltrig = read_float(b->act_trigger, b->hand_paths[0]);
-    const float rtrig = read_float(b->act_trigger, b->hand_paths[1]);
-    const float lgrip = read_float(b->act_squeeze, b->hand_paths[0]);
-    const float rgrip = read_float(b->act_squeeze, b->hand_paths[1]);
-    const bool btn_a = read_bool(b->act_a);
-    const bool btn_b = read_bool(b->act_b);
-    const bool btn_x = read_bool(b->act_x);
-    const bool btn_y = read_bool(b->act_y);
-    const bool l_click = read_bool(b->act_thumb_click, b->hand_paths[0]);
-    const bool r_click = read_bool(b->act_thumb_click, b->hand_paths[1]);
-    const bool l_menu = read_bool(b->act_menu);
-
-    // GBA KEYINPUT active-low: 0=A 1=B 2=Sel 3=Sta 4=Right 5=Left 6=Up 7=Down 8=R 9=L
-    uint16_t keys = 0x03FFu;
-    if (btn_a || rtrig > kTriggerThreshold) keys &= ~(1u << 0);
-    if (btn_b)                              keys &= ~(1u << 1);
-    if (btn_y)                              keys &= ~(1u << 2);
-    if (btn_x)                              keys &= ~(1u << 3);
-    if (lstick.x > kThumbstickDeadzone || rstick.x > kThumbstickDeadzone)   keys &= ~(1u << 4);
-    if (lstick.x < -kThumbstickDeadzone || rstick.x < -kThumbstickDeadzone) keys &= ~(1u << 5);
-    if (lstick.y > kThumbstickDeadzone || rstick.y > kThumbstickDeadzone)   keys &= ~(1u << 6);
-    if (lstick.y < -kThumbstickDeadzone || rstick.y < -kThumbstickDeadzone) keys &= ~(1u << 7);
-    if (rgrip > kGripThreshold)                                              keys &= ~(1u << 8);
-    if (ltrig > kTriggerThreshold || lgrip > kGripThreshold)                 keys &= ~(1u << 9);
-    ev.keyinput = keys;
-
-    const XrTime pose_time = b->last_predicted_time > 0 ? b->last_predicted_time : 1;
-
-    // L+R Thumbstick Click -> Cycle 3D Layered Depth [3D (6CM) -> 3D DEEP -> 2D FLAT]
-    // Single R-CLICK (on release) -> Recenter screen
-    // Single L-CLICK (on release) -> Toggle active gyro hand
-    const bool both_clicks = l_click && r_click;
-    if (both_clicks && !b->prev_both_stick_clicks) {
-        b->depth_mode = (b->depth_mode + 1) % 3;
-        b->stick_chord_consumed = true;
-        b->hud_dirty = true;
-        trigger_haptic_ns(*b, 0, 25000000LL, 0.45f);
-        trigger_haptic_ns(*b, 1, 25000000LL, 0.45f);
-        XR_LOGI("3D Layered Depth mode -> %d (step=%.2fm)",
-                b->depth_mode, static_cast<double>(depth_step_meters(b->depth_mode)));
-    }
-    b->prev_both_stick_clicks = both_clicks;
-
-    if (!l_click && !r_click) {
-        if (!b->stick_chord_consumed) {
-            if (b->prev_r_stick_click) {
-                recenter_screen_to_head(*b, pose_time);
-                trigger_haptic_ns(*b, 1, 20000000LL, 0.35f);
-            } else if (b->prev_l_stick_click) {
-                b->active_gyro_hand = 1 - b->active_gyro_hand;
-                b->hud_dirty = true;
-                trigger_haptic_ns(*b, b->active_gyro_hand, 30000000LL, 0.5f);
-                XR_LOGI("Active gyro controller -> %s",
-                        b->active_gyro_hand == 1 ? "RIGHT" : "LEFT");
-            }
-        }
-        b->stick_chord_consumed = false;
-    }
-    b->prev_r_stick_click = r_click;
-    b->prev_l_stick_click = l_click;
-
-    // Left Menu -> Cycle [MR+HUD -> MR Clean -> Dark Void Clean] (or HUD on/off if no MR)
-    if (l_menu && !b->prev_l_menu_click) {
-        if (b->passthrough_supported) {
-            b->hud_mode = (b->hud_mode + 1) % 3;
-            b->passthrough_active = (b->hud_mode != 2);
-            apply_passthrough_state(*b);
-        } else {
-            b->hud_mode = (b->hud_mode == 0) ? 1 : 0;
-        }
-        b->hud_dirty = true;
-        trigger_haptic_ns(*b, 0, 20000000LL, 0.35f);
-    }
-    b->prev_l_menu_click = l_menu;
-
-    // Touch Plus controller angular velocity around its aim face-normal (+Z) -> GBA gyro
-    XrSpaceVelocity vel{XR_TYPE_SPACE_VELOCITY};
-    XrSpaceLocation hand_loc{XR_TYPE_SPACE_LOCATION, &vel};
-    const XrSpace active_space = b->aim_spaces[b->active_gyro_hand];
-    if (active_space != XR_NULL_HANDLE &&
-        XR_SUCCEEDED(xrLocateSpace(active_space, b->local_space, pose_time, &hand_loc)) &&
-        (hand_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
-        (vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)) {
-        const XrVector3f z_axis = rotate_vec(hand_loc.pose.orientation, 0.0f, 0.0f, 1.0f);
-        const float rate_z = vel.angularVelocity.x * z_axis.x +
-                             vel.angularVelocity.y * z_axis.y +
-                             vel.angularVelocity.z * z_axis.z;
-        const float filtered = (std::abs(rate_z) >= kGyroDriftDeadzoneRadPerSec) ? rate_z : 0.0f;
-        ev.gyro_rate_z = filtered * kQuestGyroRateScale;
-        if (filtered != 0.0f && !b->gyro_motion_logged) {
-            XR_LOGI("Quest Touch Plus gyro active: hand=%s rate_z=%.3f rad/s",
-                    b->active_gyro_hand == 1 ? "RIGHT" : "LEFT",
-                    static_cast<double>(rate_z));
-            b->gyro_motion_logged = true;
-        }
-    }
-
+    ev.keyinput = b->latest_keyinput.load(std::memory_order_acquire);
+    ev.gyro_rate_z = b->latest_gyro_rate_z.load(std::memory_order_acquire);
     return ev;
 }
 
