@@ -442,6 +442,7 @@ uint32_t runtime_swi_log_save_file(const char* path);
 uint32_t runtime_trace_copy_recent(RuntimeTraceEntry* out,
                                    uint32_t max_entries);
 void runtime_tick(uint32_t cycles);
+void runtime_tick_interruptible(uint32_t cycles);
 bool runtime_should_yield(void);
 
 // ── Stage 2 idle-loop elision ──────────────────────────────────────

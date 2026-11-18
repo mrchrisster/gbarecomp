@@ -317,6 +317,17 @@ void HostWindow::close() {
 }
 bool HostWindow::set_surface_size(int w,int h) { if(!impl_||!dimensions(w,h))return false; backend(impl_)->width=w;backend(impl_)->height=h;return true; }
 bool HostWindow::drawable_size(int* w,int* h) const { if(!impl_||!w||!h)return false; auto d=backend(impl_)->shared.control.drawable.load(); *w=d&65535;*h=d>>16;return *w&&*h; }
+// Smooth motion is not offered on the web host: interpolated 2x frames are
+// skipped and native frames go through present().
+void HostWindow::present_scaled(const uint8_t* rgb, int factor) {
+    if (factor == 1) present(rgb);
+}
+bool HostWindow::display_timing(std::chrono::nanoseconds*, std::chrono::steady_clock::time_point*) const {
+    return false;
+}
+void HostWindow::set_fill_display(bool) {}
+bool HostWindow::fill_display() const { return false; }
+
 void HostWindow::present(const uint8_t* rgb) {
     if(!impl_||!rgb)return;
     auto& b=*backend(impl_);auto& s=b.shared;auto& v=s.video[b.back];
@@ -484,6 +495,8 @@ void HostWindow::haptic_pulse(int duration_ms,float strength) {
     // and is absent on some browsers (then this is a no-op, reported once).
     MAIN_THREAD_ASYNC_EM_ASM({ globalThis.GbrHost?.haptic?.($0); },std::clamp(duration_ms,1,5000));
 }
+void HostWindow::present_layered_3d(const uint8_t*, unsigned, unsigned, unsigned, const uint8_t*, bool) {}
+void HostWindow::set_rumble(bool) {}
 void host_haptic_pulse(int duration_ms,float strength) {
     if(g_haptic_window) g_haptic_window->haptic_pulse(duration_ms,strength);
 }

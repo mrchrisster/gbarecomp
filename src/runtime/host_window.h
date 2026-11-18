@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -103,13 +104,25 @@ public:
     // false until the player has chosen.
     bool saved_audio_enhanced(bool& enabled) const;
     void save_audio_enhanced(bool enabled);
+    // Whole-multiple presentation (Android full-screen layout): e.g. 6x =
+    // 1440x960 on a 1080p panel instead of the height-filling 6.75x. A
+    // `persist` change is remembered in config.ini [Display] and wins over
+    // the TOML default on later launches.
+    void set_integer_scale(bool enabled, bool persist);
+    bool integer_scale() const;
     void set_audio_enabled(bool enabled);
     bool audio_enabled() const;
     void set_resize_driven_view(bool enabled);
+    void set_menu_scancode(int scancode);
+    void set_fill_display(bool enabled);
+    bool fill_display() const;
 #if defined(GBARECOMP_RUNTIME_UI)
     // Attach the capability-only shared model. HostWindow presents it through
     // Dear ImGui's SDL_Renderer2 backend over the existing game renderer.
     void set_runtime_ui(RecompRuntimeUi* ui);
+    // Replaces the runtime menu's built-in ImGui font with a TrueType file
+    // (SDL_RWFromFile path); keeps the built-in one if it can't be read.
+    bool set_runtime_ui_font(const char* path);
 #endif
     // ---- touch (touch_input.h) ---------------------------------------------
     // `policy` = the game consumes touch through RunOptions::input_frame;
@@ -146,6 +159,8 @@ public:
 
     // Short vibration where the platform supports it (no-op otherwise).
     void haptic_pulse(int duration_ms, float strength);
+    // Cartridge or software rumble state (GPIO pin 3 / Quest Touch Plus haptics).
+    void set_rumble(bool on);
 
     void set_fps_readout(bool on);      // presents-per-second in the title bar
     bool fps_readout() const;
@@ -159,6 +174,21 @@ public:
     // The enhanced texture is uploaded and presented directly, without a
     // native-resolution intermediate render target.
     void present(const uint8_t* rgb888, unsigned width, unsigned height);
+    // Present 5 GBA priority planes (RGBA8888, 0 = Backdrop .. 4 = Priority 0)
+    // when rendering in stereoscopic layered 3D mode (Quest OpenXR), plus
+    // optional pre-masked 5-plane field composition.
+    void present_layered_3d(const uint8_t* planes_rgba, unsigned width, unsigned height,
+                            unsigned plane_count, const uint8_t* masked_planes_rgba = nullptr,
+                            bool masked_scene = false);
+    // Present a frame at `factor` (1 or 2) times the base surface size into the
+    // same destination; smooth motion's interpolated frames use 2 for
+    // half-pixel motion.
+    void present_scaled(const uint8_t* rgb888, int factor);
+    // Refresh period of the window's display, and (Windows compositor only)
+    // when its latest vblank was; `vblank` is left alone when unknown.
+    // Returns false when the period is unknown.
+    bool display_timing(std::chrono::nanoseconds* period,
+                        std::chrono::steady_clock::time_point* vblank) const;
 
     // Push `count` int16_t mono samples assuming the engine's 65.536 kHz
     // source rate. Prefer push_audio_block when the caller knows the real

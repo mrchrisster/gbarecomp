@@ -487,9 +487,30 @@ extern "C" uint8_t bus_read_u8(uint32_t addr) {
     return v;
 }
 
+// GBARECOMP_WATCH_ADDR=0x...: log every guest write that touches this address with the
+// guest call stack (offline exploration of game variables; costs one compare per write).
+static uint32_t watch_addr() {
+    static const uint32_t a = [] {
+        const char* e = std::getenv("GBARECOMP_WATCH_ADDR");
+        return (e && *e) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+    }();
+    return a;
+}
+static void watch_write(uint32_t addr, uint32_t width, uint32_t val) {
+    const uint32_t w = watch_addr();
+    if (!w || w < addr || w >= addr + width) return;
+    std::fprintf(stderr, "[watch] write%u [%08x]=%08x pc=%08x stack:", width * 8, addr, val,
+                 runtime_current_pc());
+    const uint32_t depth = runtime_call_stack_depth();
+    const uint32_t* st = runtime_call_stack_data();
+    for (uint32_t i = depth > 8 ? depth - 8 : 0; i < depth; ++i) std::fprintf(stderr, " %08x", st[i]);
+    std::fprintf(stderr, "\n");
+}
+
 extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    watch_write(addr, 4, val);
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write32(addr, val);
     ++g_idle_disturb_epoch;   // any guest write may change a watched poll value
     if (io) runtime_resync_horizon();
@@ -498,6 +519,7 @@ extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
 extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    watch_write(addr, 2, val);
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write16(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
@@ -506,6 +528,7 @@ extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
 extern "C" void bus_write_u8(uint32_t addr, uint8_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    watch_write(addr, 1, val);
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write8(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
@@ -731,33 +754,26 @@ extern "C" void runtime_resync_horizon(void) {
     recompute_event_budget(bus, ppu);
 }
 
-extern "C" void runtime_tick(uint32_t cycles) {
-    if (g_session_execution) { g_runtime_cycles += cycles; return; }
-    // P6 shadow-tick: a healed shard's validation re-run only accumulates its
-    // cycle cost (for the cycle diff); the interpreter pass already pumped the
-    // devices / delivered IRQs for this window, so do nothing else here.
-    if (g_runtime_shadow_tick) { g_runtime_shadow_cycles += cycles; return; }
-
-    auto* bus = gbarecomp::g_active_bus;
-    auto* ppu = gbarecomp::g_active_ppu;
-    if (!bus || !ppu || cycles == 0) return;
-
+static inline void service_host_hook_if_due() {
     // Some software renderers execute millions of guest instructions before
     // reaching a GBA frame boundary. Downsample the wall-clock check so native
     // window messages keep flowing without putting a clock read on every guest
     // instruction.
-    if (g_host_service_hook) {
-        static uint32_t service_tick_divider = 0;
-        if ((++service_tick_divider & 0x3FFFu) == 0) {
-            static auto last_service = std::chrono::steady_clock::now();
-            const auto now = std::chrono::steady_clock::now();
-            if (now - last_service >= std::chrono::milliseconds(8)) {
-                g_host_service_hook();
-                last_service = now;
-            }
+    if (!g_host_service_hook) return;
+    static uint32_t service_tick_divider = 0;
+    if ((++service_tick_divider & 0x3FFFu) == 0) {
+        static auto last_service = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_service >= std::chrono::milliseconds(8)) {
+            g_host_service_hook();
+            last_service = now;
         }
     }
+}
 
+static inline void runtime_tick_slice(gba::GbaBus* bus,
+                                      gba::GbaPpu* ppu,
+                                      uint32_t cycles) {
     cyc_probe("tick", cycles);
     g_runtime_cycles += cycles;
     // Lazy device catch-up: advance the master clock every instruction (cheap),
@@ -811,6 +827,54 @@ extern "C" void runtime_tick(uint32_t cycles) {
         }
         runtime_irq(g_cpu.R[15]);
     }
+}
+
+extern "C" void runtime_tick_interruptible(uint32_t cycles) {
+    if (g_session_execution) { g_runtime_cycles += cycles; return; }
+    if (g_runtime_shadow_tick) { g_runtime_shadow_cycles += cycles; return; }
+
+    auto* bus = gbarecomp::g_active_bus;
+    auto* ppu = gbarecomp::g_active_ppu;
+    if (!bus || !ppu || cycles == 0) return;
+
+    service_host_hook_if_due();
+
+    // Advance large multi-instruction spans (HLE SWIs, native mixer hooks) in
+    // next-event chunks so newly pended IRQs vector at the event boundary rather
+    // than starving until the entire span finishes.
+    uint32_t remaining = cycles;
+    while (remaining != 0) {
+        const uint32_t budget =
+            g_event_budget > 0 ? static_cast<uint32_t>(g_event_budget) : 1u;
+        const uint32_t step = remaining < budget ? remaining : budget;
+        runtime_tick_slice(bus, ppu, step);
+        remaining -= step;
+        if (gbarecomp::runtime_dispatch_suspended()) break;
+    }
+
+#ifdef GBA_COSIM
+    cosim_on_tick();
+#endif
+}
+
+extern "C" void runtime_tick(uint32_t cycles) {
+    if (g_session_execution) { g_runtime_cycles += cycles; return; }
+    // P6 shadow-tick: a healed shard's validation re-run only accumulates its
+    // cycle cost (for the cycle diff); the interpreter pass already pumped the
+    // devices / delivered IRQs for this window, so do nothing else here.
+    if (g_runtime_shadow_tick) { g_runtime_shadow_cycles += cycles; return; }
+
+    if (cycles > 64u && static_cast<long long>(cycles) > g_event_budget) {
+        runtime_tick_interruptible(cycles);
+        return;
+    }
+
+    auto* bus = gbarecomp::g_active_bus;
+    auto* ppu = gbarecomp::g_active_ppu;
+    if (!bus || !ppu || cycles == 0) return;
+
+    service_host_hook_if_due();
+    runtime_tick_slice(bus, ppu, cycles);
 
 #ifdef GBA_COSIM
     // First-divergence co-simulation checkpoint. runtime_tick is the shared

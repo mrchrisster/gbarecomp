@@ -29,6 +29,33 @@ namespace gbarecomp::debug { class SnapshotWriter; class SnapshotReader; }
 
 namespace gba {
 
+// Internal per-pixel PPU layer capture populated during scanlines when
+// layered_3d_ is active, consumed by GbaPpu::mark_framebuffer_latched().
+struct OptionBCap {
+    struct Pixel {
+        uint16_t bg_color[4]{};
+        uint16_t obj_color = 0;
+        uint8_t bg_mask = 0;     // bits 0..3: layer visible & non-transparent
+        uint8_t bg_t1_mask = 0;  // bits 0..3: BLDCNT 1st target & blend_enabled
+        uint8_t bg_prio = 0;     // 2 bits per BG
+        uint8_t obj_idx = 0xFF;  // winning OAM index 0..127, 0xFF if none
+        uint8_t obj_prio = 3;    // 0..3
+        uint8_t flags = 0;       // bit0: obj_t1, bit1: obj_semi, bit2: blackout, bit3: blend_en
+    };
+    struct Line {
+        uint16_t backdrop_color = 0;
+        uint16_t dispcnt = 0;
+        uint8_t effect = 0;
+        uint8_t eva = 0;
+        uint8_t evb = 0;
+        uint8_t bldy = 0;
+    };
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<Pixel> pixels;
+    std::vector<Line> lines;
+};
+
 class GbaPpu {
 public:
     // Optional downstream sampling density. Source artwork stays native;
@@ -166,6 +193,10 @@ public:
     // Active output dimensions = vanilla + active margins (== 240/160 when OFF).
     uint32_t render_width()  const { return kScreenWidth  + extra_left_ + extra_right_; }
     uint32_t render_height() const { return kScreenHeight + extra_top_ + extra_bottom_; }
+    // Where native (0, 0) sits in the expanded canvas: the left/top margins,
+    // or g_ws_native_view_left/top when a game places the native view itself.
+    uint32_t native_view_x() const;
+    uint32_t native_view_y() const;
     std::size_t render_bytes() const {
         return static_cast<std::size_t>(render_width()) * render_height() * 3;
     }
@@ -201,6 +232,40 @@ public:
     const uint8_t* latched_framebuffer() const { return latched_fb_.data(); }
     bool has_latched_framebuffer() const { return has_latched_fb_; }
 
+    static constexpr uint32_t kLayeredPlanes = 5;
+    std::size_t layered_plane_bytes() const {
+        return static_cast<std::size_t>(render_width()) * render_height() * 4u;
+    }
+    std::size_t layered_framebuffer_bytes() const {
+        return layered_plane_bytes() * kLayeredPlanes;
+    }
+    void set_layered_3d(bool enabled);
+    bool layered_3d() const { return layered_3d_; }
+    const uint8_t* latched_layered_3d() const {
+        return (layered_3d_ && has_latched_layered_fb_) ? latched_layered_fb_.data() : nullptr;
+    }
+    const uint8_t* latched_masked_3d() const {
+        return (layered_3d_ && has_latched_masked_fb_) ? latched_masked_fb_.data() : nullptr;
+    }
+    bool latched_masked_scene() const {
+        return layered_3d_ && has_latched_masked_fb_ && latched_masked_scene_;
+    }
+
+    // Host-only motion record for present-time frame interpolation, kept while
+    // g_ppu_record_motion is set (never serialized; empty otherwise). Each tag
+    // is the compositor key of the pixel's front layer: OBJ = priority*256 +
+    // OAM index, regular BG = priority*256 + 128 + layer, 0xFFFF = backdrop,
+    // 0xFFFE = anything else. Lines hold each visible line's scroll state.
+    struct MotionLine {
+        uint16_t dispcnt = 0;
+        uint16_t bgcnt[4] = {};
+        uint16_t hofs[4] = {};
+        uint16_t vofs[4] = {};
+    };
+    const uint16_t* latched_tags() const { return latched_tags_.empty() ? nullptr : latched_tags_.data(); }
+    const MotionLine* latched_motion_lines() const { return latched_lines_.empty() ? nullptr : latched_lines_.data(); }
+    const uint8_t* latched_oam() const { return latched_oam_.data(); }
+
 private:
     friend class SimulationStateCodec;
     std::unique_ptr<GbaHighResolutionFrame> high_resolution_;
@@ -226,6 +291,19 @@ private:
     std::vector<uint8_t> work_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     std::vector<uint8_t> latched_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     bool has_latched_fb_ = false;
+    bool layered_3d_ = false;
+    bool has_latched_layered_fb_ = false;
+    bool has_latched_masked_fb_ = false;
+    bool work_masked_scene_ = false;
+    bool latched_masked_scene_ = false;
+    std::vector<uint8_t> work_layered_fb_;
+    std::vector<uint8_t> latched_layered_fb_;
+    std::vector<uint8_t> work_masked_fb_;
+    std::vector<uint8_t> latched_masked_fb_;
+    OptionBCap work_optb_cap_;
+    std::vector<uint16_t> work_tags_, latched_tags_;      // allocated on first recorded line
+    std::vector<MotionLine> work_lines_, latched_lines_;
+    std::array<uint8_t, 1024> work_oam_{}, latched_oam_{};
 
     struct AffineLineState {
         int32_t x = 0;
@@ -283,11 +361,52 @@ extern "C" int (*g_ws_affine_filter_provider)(int bg, int screen_y);
 // established fail-closed window/savestate behavior. On lets provider-sourced
 // regular BG margins continue independently beside native HUD/dialog windows.
 extern "C" int g_ws_authored_margin_layers;
+// STOCK 3D planes: move visible opaque world sprites up to Plane 3 ("3D NEW" mode).
+extern "C" int g_layered_pop_objects;
+// STOCK 3D planes: each touching group of visible world-sprite pixels on one plane (the
+// lowest one), so a character drawn from OBJs of several priorities stays whole.
+extern "C" int g_layered_unify_objects;
+// STOCK 3D planes: split BGs that share a priority onto their own planes by BG index.
+extern "C" int g_layered_split_ties;
+// STOCK 3D planes: an OBJ joins the plane of the nearest BG drawn in front of it (priority
+// below its own) instead of the BG it is drawn over (characters stand on the terrain plane).
+extern "C" int g_layered_obj_forward;
+// STOCK 3D planes: the world sprites get their own plane between the BGs in front of them and
+// the BGs they are drawn over (the backdrop colour moves onto the backmost BG's plane).
+extern "C" int g_layered_obj_plane;
+// STOCK 3D planes: bitmap-mode scenes (modes 3-5) stay whole on the middle plane.
+extern "C" int g_layered_flat_bitmap;
+// STOCK 3D: world sprites drawn on a separate sixth layer (not a GBA priority plane), shown by the
+// host at g_layered_sprite_depth (plane units, 0 = backdrop .. 4 = front). latched_sprite_layer()
+// returns the last frame's RGBA (render size) or nullptr.
+extern "C" int g_layered_sprite_layer;
+// STOCK 3D: a translucent BG over other planes is written as a see-through layer (EVA/16 alpha)
+// instead of pre-blended with the planes behind it.
+extern "C" int g_layered_fog_alpha;
+// Metres the plane receiving split-off decoration (and planes behind it) moves further back.
+extern "C" float g_layered_split_push;
+// STOCK 3D game hook: fill out[x] = 1 for pixels of BG `bg` on screen row y that are decoration
+// (not gameplay terrain); those go one plane further back. io/vram are this scanline's.
+extern "C" void (*g_layered_bg_split_row)(int bg, int y, const uint8_t* io, const uint8_t* vram,
+                                          uint8_t* out, int width);
+extern "C" float g_layered_sprite_depth;       // < 0 = automatic (see gba_ppu.cpp)
+extern "C" float g_layered_sprite_depth_live;  // depth the host shows this frame
+const uint8_t* latched_sprite_layer();
+// STOCK 3D planes: >0 pushes slower-scrolling BG planes back by their parallax distance
+// (scale factor); the result per plane (metres) is g_layered_plane_depth_bias.
+extern "C" float g_layered_parallax_depth;
+extern "C" float g_layered_plane_depth_bias[5];
 // Host-only placement of native X=0 within an expanded canvas. Negative keeps
 // the configured left margin; otherwise clamped to [0, render_width - 240].
 // All BG, OBJ, window and authored-margin coordinates share this origin.
 // The native renderer ignores it; it is never serialized as guest state.
 extern "C" int g_ws_native_view_left;
+// The same for native Y=0, clamped to [0, render_height - 160]. Rows above
+// the native view render at scanline 0, rows below after its last line.
+extern "C" int g_ws_native_view_top;
+// Called as an expanded frame starts rendering (scanline 0), with the scroll
+// and VRAM state that frame shows: a game can place the native view here.
+extern "C" void (*g_ws_frame_start)();
 extern "C" int g_ws_pillarbox;  // Step C policy: black margins on non-field screens
 extern "C" int g_ws_pillarbox_left;
 extern "C" int g_ws_pillarbox_right;
@@ -317,6 +436,16 @@ extern "C" int (*g_ws_obj_attr_y_provider)(int oam_index,
 // keeps the established expanded-viewport OBJ test.
 extern "C" int g_ws_obj_native_clip;
 
+// Present-time frame interpolation (host-only, default off). While
+// g_ppu_record_motion is nonzero the PPU keeps the motion record above. A
+// runtime with g_present_interpolator set calls it once per display refresh
+// with the newest finished frame and how far (0 <= t < 1) the moment shown
+// lies from the previous frame to it; returning nonzero means out2x now holds
+// that moment as a (2w x 2h RGB888) frame. Zero means no smooth motion now.
+extern "C" int g_ppu_record_motion;
+extern "C" int (*g_present_interpolator)(const GbaPpu* ppu, const uint8_t* rgb,
+                                         uint32_t w, uint32_t h, uint8_t* out2x, float t);
+
 // Read-only, game-authored OBJ coverage for expanded margins. RGB555 bit 15
 // marks a transparent pixel. Priority uses the hardware 0..3 BG/OBJ order.
 // The PPU never consumes this layer inside the native 240x160 viewport.
@@ -330,5 +459,22 @@ struct WsMarginObjPixel {
 };
 extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(
     int screen_y, int* hardware_left, int* width);
+
+// Optional per-pixel collision query in native-relative screen coordinates
+// (hx, y) for Option B 2.5D separation. Returns:
+//   -1 = unavailable (not on a known field map -> graceful fallback)
+//    0 = walkable ground/floor (used to model floor tiles & avoid splitting floor)
+//    1 = solid obstacle / wall / furniture
+extern "C" int g_layered_solid_provider_wanted;
+extern "C" int (*g_layered_solid_provider)(int hx, int y);
+extern "C" void (*g_layered_solid_row_provider)(int hx0, int y, int count, std::int8_t* out);
+// Optional per-pixel / per-tile depth plane override for Masked 5-Plane 3D:
+//   -1 = auto-classify, 0 = void/backdrop, 1 = shell (floor/walls),
+//    2 = furniture/props, 4 = foreground overhang.
+extern "C" int (*g_layered_plane_provider)(int hx, int y, int bg_layer);
+extern "C" void (*g_layered_plane_row_provider)(int hx0, int y, int count, int bg_layer, std::int8_t* out);
+extern "C" int g_layered_bg1_detached;
+// Current map is an interior room: STOCK 3D stays pure stock there (only authored overrides).
+extern "C" int g_layered_interior;
 
 }  // namespace gba

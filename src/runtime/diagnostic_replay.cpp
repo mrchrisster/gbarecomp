@@ -488,6 +488,13 @@ void DiagnosticReplay::shutdown() {
 // ── Playback ─────────────────────────────────────────────────────────────
 
 void DiagnosticReplay::fail_playback(const std::string& why) {
+    // GBARECOMP_REPLAY_LENIENT: exploration runs keep going (inputs may drift).
+    if (const char* e = std::getenv("GBARECOMP_REPLAY_LENIENT"); e && *e && *e != '0' &&
+        why.find("must name") == std::string::npos) {
+        static int s_n = 0;
+        if (++s_n <= 3) std::fprintf(stderr, "[gbarecomp:diagnostics] lenient: ignoring failure: %s\n", why.c_str());
+        return;
+    }
     if (failed_) return;
     failed_ = true;
     pending_end_ = false;
@@ -784,6 +791,19 @@ void DiagnosticReplay::playback_end() {
             same = same && match;
         }
         detail += std::string(" ") + regions[i].name + (match ? "=match" : "=DIFFERS");
+    }
+    // GBARECOMP_REPLAY_LENIENT=1: keep feeding the recorded inputs past a checkpoint
+    // mismatch (cross-build/platform playback for offline exploration, not verification).
+    static const bool s_lenient = [] {
+        const char* e = std::getenv("GBARECOMP_REPLAY_LENIENT");
+        return e && *e && *e != '0';
+    }();
+    if (!same && s_lenient) {
+        static int s_warned = 0;
+        if (++s_warned <= 3)
+            std::fprintf(stderr, "[gbarecomp:diagnostics] lenient: frame %llu differs (%s), continuing\n",
+                         frame, detail.c_str());
+        return;
     }
     if (same) {
         ++matched_;

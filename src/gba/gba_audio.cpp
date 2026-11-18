@@ -887,12 +887,13 @@ int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
     // full).
     int32_t master_avg = (volume_l_ + volume_r_);  // 0..14
     // Combine: mix * (master_avg / 14) * (dmg / 4) * gain.
-    // Mix range: ±30 (both ch active at vol 15). Master 14 (max).
-    // dmg 1/1. Pre-gain magnitude: 30 * 14 / 14 * 1 = 30. We need
-    // headroom for int16; scale by ~1000 leaves margin.
+    // On GBA hardware (10-bit DAC), max 4-ch PSG sum (±60 at dmg 100%) maps to
+    // roughly ±512 DAC units, matching one full-scale DirectSound channel (±512
+    // when scaled to direct_out * 48 = ±24,576 -> 512/60 * 48 ≈ 410). Keeping
+    // kGain at 420 prevents loud PSG bells/SFX from overpowering DirectSound.
     int32_t out = (mix * master_avg) / 14;
     out = (out * dmg_scale_num) / dmg_scale_den;
-    constexpr int32_t kGain = 600;
+    constexpr int32_t kGain = 420;
     out *= kGain;
 
     // Direct Sound FIFO contribution. Omitted when the MP2K shadow is
@@ -916,6 +917,17 @@ int16_t GbaAudio::mix_one_sample(uint32_t direct_slot, bool include_direct,
         out += direct_out;
     }
 
+    // Soft-knee limiter above ±26000 so simultaneous music + loud chimes/bells
+    // compress cleanly into ±32767 instead of hard-clipping.
+    constexpr int32_t kKnee = 26000;
+    constexpr int32_t kHeadroom = 32767 - kKnee;
+    if (out > kKnee) {
+        const int32_t over = out - kKnee;
+        out = kKnee + (over * kHeadroom) / (over + kHeadroom);
+    } else if (out < -kKnee) {
+        const int32_t over = -out - kKnee;
+        out = -(kKnee + (over * kHeadroom) / (over + kHeadroom));
+    }
     if (out > 32767)  out = 32767;
     if (out < -32767) out = -32767;
 

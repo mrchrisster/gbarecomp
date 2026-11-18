@@ -197,6 +197,9 @@ struct Args {
     bool sharp_filter = false;    // --sharp-filter 1: integer prescale + linear finish
     int internal_resolution = 1;
     bool internal_resolution_set = false;
+    // [video] integer_scale = true|false — default for whole-multiple
+    // presentation on Android (the in-game menu choice, once made, wins).
+    bool integer_scale = false;
     bool affine_filter = false;   // --affine-filter 1: game-authorized smoothing
     float gyro_sensitivity = 0.25f; // --gyro-sensitivity 0.25..4.00
     // [audio] shadow = true|false — arm the MP2K verified-enhancement shadow
@@ -293,6 +296,7 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE) == 0 && c->internal_resolution)
         *out = *c->internal_resolution;
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) *out = c->window->linear_filter();
+    else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0) *out = c->window->integer_scale();
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0) *out = c->window->audio_enabled();
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) *out = c->window->volume();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_STATE_SLOT) == 0) *out = c->state_slot;
@@ -306,6 +310,10 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key,
                          GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
         *out = c->fast_forward_multiplier;
+    else if (std::strcmp(item->key, "gbarecomp.display.fill") == 0)
+        *out = c->window->fill_display();
+    else if (std::strcmp(item->key, "gbarecomp.touch.pad_visible") == 0)
+        *out = c->window->touch_pad_visible();
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
              c->gyro_sensitivity)
@@ -329,6 +337,8 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         *c->internal_resolution = std::clamp(value, 1, int(gba::GbaHighResolutionFrame::kMaxScale));
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0)
         c->window->set_linear_filter(value != 0);
+    else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0)
+        c->window->set_integer_scale(value != 0, /*persist=*/true);
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0)
         c->window->set_audio_enabled(value != 0);
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0)
@@ -349,6 +359,10 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
     else if (std::strcmp(item->key,
                          GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
         c->fast_forward_multiplier = std::clamp(value, 2, 10);
+    else if (std::strcmp(item->key, "gbarecomp.display.fill") == 0)
+        c->window->set_fill_display(value != 0);
+    else if (std::strcmp(item->key, "gbarecomp.touch.pad_visible") == 0)
+        c->window->set_touch_pad_visible(value != 0);
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
              c->gyro_sensitivity)
@@ -810,6 +824,8 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
                 return false;
             }
             args->internal_resolution = scale;
+        } else if (section == "video" && key == "integer_scale") {
+            args->integer_scale = (val == "true" || val == "1");
         } else if (section == "video" && key == "affine_filter") {
             args->affine_filter = (val == "true" || val == "1");
         } else if (section == "video" && key == "widescreen") {
@@ -1485,12 +1501,21 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         spec.expected_crc32 = args.bios_crc32;
         auto r = resolve_asset(args.bios, spec, argv[0]);
         if (!r.ok) {
-            std::fprintf(stderr,
-                         "[gbarecomp:runtime] BIOS resolution failed: %s\n",
-                         r.error.c_str());
-            return 1;
+            if (!netplay) {
+                std::fprintf(stderr,
+                             "[gbarecomp:runtime] BIOS not found (%s); "
+                             "falling back to built-in HLE BIOS stub\n",
+                             r.error.c_str());
+                args.bios.clear();
+            } else {
+                std::fprintf(stderr,
+                             "[gbarecomp:runtime] BIOS resolution failed: %s\n",
+                             r.error.c_str());
+                return 1;
+            }
+        } else {
+            args.bios = r.path;
         }
-        args.bios = r.path;
     }
 
     // Resolve ROM the same way. The per-game TOML supplies the
@@ -1543,9 +1568,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // empty expected hash here so a non-canonical-but-warned dump
     // doesn't trip a hard fail in the loader.
     gba::GbaBios bios;
-    if (!bios.load_from_file(args.bios, std::string{}, &err)) {
-        std::fprintf(stderr, "[gbarecomp:runtime] %s\n", err.c_str());
-        return 1;
+    if (args.bios.empty()) {
+        bios.load_hle_stub();
+    } else if (!bios.load_from_file(args.bios, std::string{}, &err)) {
+        if (!netplay) {
+            std::fprintf(stderr,
+                         "[gbarecomp:runtime] %s; falling back to built-in HLE BIOS stub\n",
+                         err.c_str());
+            bios.load_hle_stub();
+        } else {
+            std::fprintf(stderr, "[gbarecomp:runtime] %s\n", err.c_str());
+            return 1;
+        }
     }
 
     std::vector<uint8_t> rom;
@@ -1560,7 +1594,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         return 1;
     }
     std::string rom_sha1 = lower_ascii(gba::sha1(rom.data(), rom.size()).hex());
-    if (rom_sha1 != lower_ascii(args.rom_sha1)) {
+    if (opts.rom_post_load_hook &&
+        opts.rom_post_load_hook(rom.data(), rom.size(), rom_sha1.c_str()))
+        rom_sha1 = lower_ascii(gba::sha1(rom.data(), rom.size()).hex());
+    const std::string alt_sha1 = opts.alt_rom_sha1 ? lower_ascii(opts.alt_rom_sha1) : "";
+    if (!opts.allow_rom_sha1_mismatch && rom_sha1 != lower_ascii(args.rom_sha1) &&
+        (alt_sha1.empty() || rom_sha1 != alt_sha1)) {
         std::fprintf(stderr,
                      "[gbarecomp:runtime] ROM SHA-1 mismatch: got %s expected %s\n",
                      rom_sha1.c_str(), args.rom_sha1.c_str());
@@ -1689,6 +1728,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
     gba::bios_hle_set_mode(args.bios_hle ? gba::BiosHleMode::On
                                          : gba::BiosHleMode::Off);
+    gba::bios_hle_set_full_fallback(bios.hle_stub());
     if (!args.quiet)
         std::printf("bios_backend=%s\n",
                     gba::bios_hle_mode_name(gba::bios_hle_mode()));
@@ -1712,6 +1752,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     g_force_interp = 0;
     if (const char* fi = std::getenv("GBARECOMP_FORCE_INTERP"))
         g_force_interp = (fi[0] && fi[0] != '0') ? 1 : 0;
+    // Never dispatch a different translation through this build's native corpus.
+    if (opts.allow_rom_sha1_mismatch && rom_sha1 != lower_ascii(opts.builtin_rom_sha1 ? opts.builtin_rom_sha1 : args.rom_sha1) &&
+        (alt_sha1.empty() || rom_sha1 != alt_sha1))
+        g_force_interp = 1;
     std::fprintf(stderr, "cpu_backend=%s\n",
                  g_force_interp ? "interpreter (GBARECOMP_FORCE_INTERP)"
                                 : "static-recompiled");
@@ -1742,6 +1786,56 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // checkpoint hook in runtime_tick parks the guest at cycle-stride boundaries.
     cosim_init();
 #endif
+
+    // GBARECOMP_PLANE_DUMP=<dir>: render the 5 Quest 3D planes on desktop too and write the
+    // last frame's stock planes, semantic (masked) planes and composite at exit. Used to
+    // inspect which depth plane each building lands on from a Quest suspend state.
+    // Playback-relative frame (set by the headless playback boundary) for exploration hooks.
+    static uint64_t s_playback_rel_frame = 0;
+    (void)s_playback_rel_frame;
+    // GBARECOMP_ARG0_OVERRIDE="<pc>[,<pc>...]:<from>:<to>": whenever a listed guest function
+    // is entered with r0 == from, replace r0 with to. Offline exploration only, e.g. making a
+    // game's map-warp script command load a different map than the recorded one.
+    if (const char* e = std::getenv("GBARECOMP_ARG0_OVERRIDE"); e && *e && !g_runtime_fn_entry_hook) {
+        static std::vector<uint32_t> s_pcs;
+        static uint32_t s_value = 0, s_from = 0;
+        std::string spec = e;
+        const auto colon = spec.find(':');
+        if (colon != std::string::npos) {
+            char* end = nullptr;
+            s_from = static_cast<uint32_t>(std::strtoul(spec.c_str() + colon + 1, &end, 0));
+            s_value = (end && *end == ':') ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0)) : s_from;
+            std::string list = spec.substr(0, colon);
+            for (size_t p = 0; p < list.size();) {
+                const size_t q = list.find(',', p);
+                s_pcs.push_back(static_cast<uint32_t>(std::strtoul(list.substr(p, q - p).c_str(), nullptr, 0)));
+                if (q == std::string::npos) break;
+                p = q + 1;
+            }
+            static const bool s_log_all = std::getenv("GBARECOMP_ARG0_LOG") != nullptr;
+            static const uint64_t s_from_frame = [] {
+                const char* f = std::getenv("GBARECOMP_ARG0_FROM_FRAME");
+                return (f && *f) ? std::strtoull(f, nullptr, 0) : 0ull;
+            }();
+            g_runtime_fn_entry_hook = [](uint32_t pc) {
+                if (s_log_all && (g_cpu.R[0] == s_from || g_cpu.R[1] == s_from || g_cpu.R[2] == s_from))
+                    std::fprintf(stderr, "[arg0-log] %08x r0=%u r1=%u r2=%u f=%llu\n", pc, g_cpu.R[0], g_cpu.R[1], g_cpu.R[2],
+                                 static_cast<unsigned long long>(s_playback_rel_frame));
+                static std::vector<uint32_t> s_done;  // one-shot per function
+                if (s_playback_rel_frame < s_from_frame) return;
+                for (uint32_t t : s_pcs)
+                    if (t == pc && g_cpu.R[0] == s_from &&
+                        std::find(s_done.begin(), s_done.end(), pc) == s_done.end()) {
+                        s_done.push_back(pc);
+                        std::fprintf(stderr, "[arg0] %08x r0 %u -> %u\n", pc, g_cpu.R[0], s_value);
+                        g_cpu.R[0] = s_value;
+                    }
+            };
+        }
+    }
+    const char* plane_dump_dir = std::getenv("GBARECOMP_PLANE_DUMP");
+    if (const char* pop = std::getenv("GBARECOMP_POP_OBJECTS")) gba::g_layered_pop_objects = std::atoi(pop);
+    if (plane_dump_dir && *plane_dump_dir) ppu.set_layered_3d(true);
 
     const char* ws_wip_env = std::getenv("GBARECOMP_WS_WIP");
     const bool ws_wip_enabled =
@@ -1918,7 +2012,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         bus.audio().shadow_hook_pcs(g_runtime_observed_pcs,
                                     RUNTIME_MAX_OBSERVED_PCS));
     g_runtime_dispatch_observer = g_runtime_observed_pc_count
-        ? [](uint32_t pc, int thumb) {
+        ? +[](uint32_t pc, int thumb) {  // + : GCC 11 won't pick a common type with nullptr
               if (gba::GbaBus* b = gbarecomp::active_bus())
                   b->audio().shadow_driver_tick(pc, thumb != 0);
           }
@@ -2293,6 +2387,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             uint32_t n = runtime_swi_log_save_file(sl);
             std::printf("swi_log_saved path=\"%s\" records=%u\n", sl, n);
         }
+        if (const char* ew = std::getenv("GBARECOMP_EWRAM_DUMP")) {
+            std::ofstream dump(ew, std::ios::binary | std::ios::trunc);
+            dump.write(reinterpret_cast<const char*>(bus.ewram_ptr()),
+                       256 * 1024);
+            std::printf("ewram_dump_saved path=\"%s\" ok=%d\n", ew, dump ? 1 : 0);
+        }
         if (const char* iw = std::getenv("GBARECOMP_IWRAM_DUMP")) {
             std::ofstream dump(iw, std::ios::binary | std::ios::trunc);
             dump.write(reinterpret_cast<const char*>(bus.iwram_ptr()),
@@ -2379,7 +2479,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     auto do_savestate_save = [&](const std::string& path,
                                  std::string& e) -> bool {
-        return debug::save_state(path.c_str(), make_snapshot_ctx(), &e);
+        if (!debug::save_state(path.c_str(), make_snapshot_ctx(), &e)) return false;
+        if (opts.savestate_written) opts.savestate_written(path.c_str());
+        return true;
     };
     auto do_savestate_load = [&](const std::string& path,
                                  std::string& e) -> bool {
@@ -2407,6 +2509,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #if defined(GBARECOMP_WEB_HOST)
         bus.audio().discard_playback();
 #endif
+        if (opts.savestate_loaded) opts.savestate_loaded(path.c_str());
         return true;
     };
     auto do_savestate_save_bytes = [&](std::vector<uint8_t>& bytes,
@@ -2427,6 +2530,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #if defined(GBARECOMP_WEB_HOST)
         bus.audio().discard_playback();
 #endif
+        if (opts.savestate_loaded) opts.savestate_loaded(nullptr);
         return true;
     };
 
@@ -2664,11 +2768,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     if (opts.input_frame) {
         TouchHub::instance().set_claims(opts.touch_gesture_claims);
         publish_headless_touch_presentation();
-        runtime_set_vblank_input_hook(run_touch_policy);
         if (!args.quiet)
             std::printf("touch_policy=ENABLED claims=0x%x%s\n",
                         static_cast<unsigned>(opts.touch_gesture_claims),
                         touch_policy_suspended ? " (suspended: input replay)" : "");
+    }
+    if (opts.input_frame || opts.vblank_frame) {
+        runtime_set_vblank_input_hook([&run_touch_policy, &opts]() {
+            if (opts.input_frame) run_touch_policy();
+            if (opts.vblank_frame) opts.vblank_frame();
+        });
     }
     struct ClearVblankInputHook {
         ~ClearVblankInputHook() { runtime_set_vblank_input_hook(nullptr); }
@@ -2909,6 +3018,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         framedump_start = std::strtoull(e, nullptr, 0);
     if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_COUNT"))
         framedump_max = std::atoi(e);
+    // Optional sampling stride for long soak captures (default 1 = every frame).
+    uint64_t framedump_stride = 1;
+    if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_STRIDE"))
+        framedump_stride = std::max<uint64_t>(1, std::strtoull(e, nullptr, 0));
     // ── HP-002 frame-phase ring ─────────────────────────────────────────
     // Opt-in per-presented-frame breakdown of where wall time went
     // between consecutive presents: guest execution, view-sync + render/
@@ -2992,13 +3105,93 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     FramePhaseRing frame_phase;
     uint64_t high_resolution_presented = 0;
+    // Declared ahead of present_live_frame, which reads both.
+    // Wall-clock frame limiter — constructed only for windowed runs so
+    // the Windows timer-resolution bump doesn't apply to headless/TCP
+    // batch runs (which intentionally run uncapped).
+    std::optional<FramePacer> pacer;
+    bool fast_forward_active = false;
+    // Smooth motion: a game that installs gba::g_present_interpolator gets an
+    // interpolated frame on every display refresh between its real frames.
+    // Native presentation only; the high-resolution surface is presented as is.
+    std::vector<uint8_t> interpolated_fb;
+    // One present per display refresh, early in the refresh before the one it
+    // is for, so each lands in its own refresh. It shows the moment that far
+    // from the previous frame (fully shown at smooth_origin()) to this one. A
+    // refresh whose present would fall after the next frame's deadline, or
+    // that needs the next frame, is left for the next call.
+    std::chrono::steady_clock::time_point smooth_slot{};  // next refresh not yet presented
+    bool smooth_on = false;                               // the game's last answer
+    auto present_smooth = [&]() -> bool {
+        using clock = std::chrono::steady_clock;
+        const auto frame = pacer->period();
+        const clock::time_point origin = pacer->smooth_origin();
+        const clock::time_point deadline = pacer->frame_start() + frame;
+        interpolated_fb.resize(ppu.render_bytes() * 4u);
+        const uint32_t w = ppu.render_width(), h = ppu.render_height();
+        if (!smooth_on && !(smooth_on = gba::g_present_interpolator(&ppu, live_fb.data(), w, h,
+                                                                    interpolated_fb.data(), 0.5f) != 0))
+            return false;
+        std::chrono::nanoseconds refresh{};
+        clock::time_point vblank{};
+        if (!win.display_timing(&refresh, &vblank) || refresh < std::chrono::milliseconds(2))
+            refresh = frame / 2;
+        const clock::time_point now = clock::now();
+        if (vblank == clock::time_point{}) vblank = smooth_slot != clock::time_point{} ? smooth_slot : now;
+        clock::time_point slot = vblank + ((std::max(smooth_slot, now) - vblank) / refresh) * refresh;
+        while (slot <= now || slot < smooth_slot - refresh / 2) slot += refresh;
+        constexpr auto kEarly = std::chrono::milliseconds(1);
+        for (;; slot += refresh) {
+            const clock::time_point at = std::max(slot - refresh + kEarly, clock::now());
+            if (at > deadline || slot > origin + frame) break;
+            pacer->sleep_until(at);
+            if (clock::now() >= slot) continue;  // missed this refresh
+            const float t = std::chrono::duration<float>(slot - origin) / std::chrono::duration<float>(frame);
+            if (t >= 0.999f) {
+                win.present(live_fb.data());
+            } else if (gba::g_present_interpolator(&ppu, live_fb.data(), w, h, interpolated_fb.data(),
+                                                   std::max(t, 0.0f))) {
+                win.present_scaled(interpolated_fb.data(), 2);
+            } else {
+                smooth_on = false;
+                win.present(live_fb.data());
+                break;
+            }
+        }
+        smooth_slot = slot;
+        return true;
+    };
     auto present_live_frame = [&]() {
         ppu.set_internal_resolution(args.internal_resolution, opts.high_resolution_affine_provider);
         if (const auto* pixels = ppu.high_resolution_framebuffer()) {
             const auto* hd = ppu.high_resolution();
             win.present(pixels, hd->width(), hd->height());
             ++high_resolution_presented;
-        } else win.present(live_fb.data());
+            return;
+        }
+        if (const auto* planes = ppu.latched_layered_3d()) {
+            unsigned plane_count = gba::GbaPpu::kLayeredPlanes;
+            // Separate sprite layer (g_layered_sprite_layer): handed over as a sixth plane.
+            static std::vector<uint8_t> with_sprites;
+            if (const uint8_t* spr = gba::latched_sprite_layer()) {
+                const size_t pb = ppu.layered_plane_bytes();
+                with_sprites.resize(pb * (gba::GbaPpu::kLayeredPlanes + 1));
+                std::memcpy(with_sprites.data(), planes, pb * gba::GbaPpu::kLayeredPlanes);
+                std::memcpy(with_sprites.data() + pb * gba::GbaPpu::kLayeredPlanes, spr, pb);
+                planes = with_sprites.data();
+                plane_count = gba::GbaPpu::kLayeredPlanes + 1;
+            }
+            win.present_layered_3d(planes, ppu.render_width(),
+                                   ppu.render_height(),
+                                   plane_count,
+                                   ppu.latched_masked_3d(),
+                                   ppu.latched_masked_scene());
+            return;
+        }
+        if (gba::g_present_interpolator && pacer && !pacer->uncapped() && !fast_forward_active &&
+            present_smooth())
+            return;
+        win.present(live_fb.data());
     };
     auto apply_runtime_view_geometry = [&](ViewGeometry geometry) -> bool {
         if (opts.view_geometry) opts.view_geometry(&geometry, 0, 0);
@@ -3089,10 +3282,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         return true;
     };
-    // Wall-clock frame limiter — constructed only for windowed runs so
-    // the Windows timer-resolution bump doesn't apply to headless/TCP
-    // batch runs (which intentionally run uncapped).
-    std::optional<FramePacer> pacer;
     // Windowed observe-mode TCP (see Args::tcp_observe_port). Savestate
     // requests from its thread are executed by the main loop at the next
     // present, the only point where machine state is consistent.
@@ -3182,6 +3371,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             win.configure_touch(opts.input_frame != nullptr,
                                 opts.touch_gesture_claims,
                                 opts.touch_pad_default, args.touch_emulation);
+            win.set_integer_scale(args.integer_scale, /*persist=*/false);
             win.set_touch_config_dir(exe_dir.c_str());
             // The player's menu choice wins over [audio].shadow;
             // GBARECOMP_AUDIO_SHADOW still overrides both.
@@ -3232,6 +3422,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
         win.set_volume(args.volume);
+        win.set_menu_scancode(opts.runtime_menu_scancode);
         win.set_fps_readout(opts.show_fps_by_default);
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
@@ -3263,7 +3454,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         RecompRuntimeUiStandardConfig runtime_ui_config{};
         runtime_ui_config.menu.title = runtime_title;
         runtime_ui_config.menu.subtitle = "Game Boy Advance runtime settings";
-        runtime_ui_config.menu.theme = "gba";
+        runtime_ui_config.menu.theme = opts.runtime_ui_theme ? opts.runtime_ui_theme : "gba";
 #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
         if (opts.ui_touch_friendly) {
             runtime_ui_config.menu.presentation_flags |=
@@ -3308,15 +3499,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE |
                 RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE;
         }
-        // INTEGER_SCALE is deliberately absent: HostWindow::adjust_scale only
+        // INTEGER_SCALE is absent on desktop: HostWindow::adjust_scale only
         // ever produces integer scales (clamped 1..8), so there is no
-        // fractional mode for a toggle to switch off. Offering one would
-        // advertise a choice the presentation path cannot make.
+        // fractional mode for a toggle to switch off. Android's full-screen
+        // layout does fill the display fractionally, so it offers the choice.
 #if !defined(__ANDROID__)
         runtime_ui_config.features |=
             RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
             RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE;
 #else
+        runtime_ui_config.features |= RECOMP_RUNTIME_UI_STANDARD_INTEGER_SCALE;
         // A mobile game has no window to close and the system Back button is
         // routed to the game, so the menu is the only clean way out: it ends
         // the session (save flushed, no suspend state) and the Activity
@@ -3446,6 +3638,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         fps_item.type        = RECOMP_RUNTIME_UI_BOOL;
         runtime_ui_extras.push_back(fps_item);
 
+#if defined(__ANDROID__)
+        RecompRuntimeUiItem fullscreen_item{};
+        fullscreen_item.key = RECOMP_RUNTIME_UI_KEY_FULLSCREEN;
+        fullscreen_item.section = "Display";
+        fullscreen_item.label = "Hide system bars";
+        fullscreen_item.description = "Hide Android system bars while playing.";
+        fullscreen_item.type = RECOMP_RUNTIME_UI_BOOL;
+        runtime_ui_extras.push_back(fullscreen_item);
+
+        RecompRuntimeUiItem fill_item{};
+        fill_item.key = "gbarecomp.display.fill";
+        fill_item.section = "Display";
+        fill_item.label = "Fill display (stretch)";
+        fill_item.description = "Stretch the original image to the display without repeating scenery.";
+        fill_item.type = RECOMP_RUNTIME_UI_BOOL;
+        runtime_ui_extras.push_back(fill_item);
+
+        RecompRuntimeUiItem touch_pad_item{};
+        touch_pad_item.key = "gbarecomp.touch.pad_visible";
+        touch_pad_item.section = "Display";
+        touch_pad_item.label = "On-screen buttons";
+        touch_pad_item.description = "Show or hide the touch gamepad overlay.";
+        touch_pad_item.type = RECOMP_RUNTIME_UI_BOOL;
+        runtime_ui_extras.push_back(touch_pad_item);
+#endif
+
         if (opts.ui_extra_items && opts.ui_extra_item_count) {
             const auto* game_items =
                 static_cast<const RecompRuntimeUiItem*>(opts.ui_extra_items);
@@ -3458,9 +3676,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_ui_context.ui =
             recomp_runtime_ui_create_standard(&runtime_ui_config);
         win.set_runtime_ui(runtime_ui_context.ui);
+        if (opts.runtime_ui_font) win.set_runtime_ui_font(opts.runtime_ui_font);
 #endif
         sync_resize_driven_view();
         if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
+#if defined(GBARECOMP_QUEST_XR)
+        ppu.set_layered_3d(true);
+#else
+        // Desktop layer view (host_window.cpp): the headset's STOCK 3D layers, tilted.
+        if (const char* lv = std::getenv("GBARECOMP_LAYER_VIEW"); lv && *lv && *lv != '0')
+            ppu.set_layered_3d(true);
+#endif
         pacer.emplace();  // paces to the GBA's 59.7275 Hz by default
         pacer->set_uncapped(args.uncapped); // no frame skipping/audio suppression
     }
@@ -3533,7 +3759,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         return !opts.expose_assist_tools || win.assist_tools_enabled();
 #endif
     };
-    bool fast_forward_active = false;
     int fast_forward_multiplier = std::clamp(
         win.fast_forward_multiplier(), 2, 10);
     auto capture_rewind_point = [&]() {
@@ -3820,6 +4045,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 static_cast<int>(raw_offset * args.gyro_sensitivity *
                                  gyro_sensitivity_calibration),
                 -0x600, 0x600));
+            win.set_rumble(bus.gyro().rumble_on());
         }
         // Record the COMPOSED register (host keys AND any touch-policy
         // synthesis) so a replay reproduces exactly what the guest read,
@@ -4145,7 +4371,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             win.reset_audio();
             host_audio_state_epoch = g_runtime_state_epoch;
         }
-        // Bounded work, including 262144 Hz source frames and rate transitions.
+#endif
+        // Bounded drain across rate boundaries and multi-block frames (including
+        // >2048-sample frames and SOUNDBIAS transitions).
         for (int budget = 0; budget < 16; ++budget) {
             uint32_t rate = 0;
             const auto n = bus.audio().drain_sample_block(audio_buf, 2048, rate);
@@ -4155,14 +4383,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 win.push_audio_block(audio_buf, n, rate);
             }
         }
-#else
-        uint32_t rate = 0;
-        const auto n = bus.audio().drain_sample_block(audio_buf, 2048, rate);
-        if (n && !fast_forward_active) {
-            gba_mod_audio_mix_at_rate(audio_buf, n, rate);
-            win.push_audio_block(audio_buf, n, rate);
-        }
-#endif
     };
     auto service_host_pause = [&]() {
         bool waited = false;
@@ -4463,9 +4683,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     }
                 }
                 if (phase_active) fp_t1 = FramePhaseRing::now_ns();
+                drain_host_audio();
                 if (present_frame) present_live_frame();
                 if (phase_active) fp_t2 = FramePhaseRing::now_ns();
-                drain_host_audio();
                 // Windowed present-in-place stays inside one step_once() for
                 // the whole session, so the outer loop's auto-flush never runs.
                 maybe_flush_battery(frame);
@@ -4535,6 +4755,39 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             runtime_shutdown();
             return 1;
         }
+    } else if (opts.resume_suspend_state_on_launch &&
+               [] { const char* e = std::getenv("GBARECOMP_AUTO_RESUME"); return e && *e == '0'; }()) {
+        // Auto resume switched off by the player: boot fresh, drop the marker.
+        clear_suspend_marker();
+        std::printf("auto_resume off: booting fresh\n");
+        std::fflush(stdout);
+    } else if (opts.resume_suspend_state_on_launch && opts.resume_newest_state_on_launch) {
+        // Load the newest state the player has: the suspend state or any save slot.
+        std::error_code ec;
+        std::string best;
+        std::filesystem::file_time_type best_t{};
+        auto consider = [&](const std::string& p) {
+            std::error_code e2;
+            if (!std::filesystem::exists(p, e2)) return;
+            const auto t = std::filesystem::last_write_time(p, e2);
+            if (e2) return;
+            if (best.empty() || t > best_t) { best = p; best_t = t; }
+        };
+        consider(suspend_state_path());
+        for (int slot = 1; slot <= 10; ++slot) consider(slot_path(slot));
+        if (!best.empty()) {
+            std::string e;
+            if (do_savestate_load(best, e)) {
+                std::printf("auto_resumed path=\"%s\" frame=%llu\n", best.c_str(),
+                            static_cast<unsigned long long>(ppu.frame_count()));
+                std::fflush(stdout);
+                last_presented_frame = ppu.frame_count() - 1;
+            } else {
+                std::fprintf(stderr, "[gbarecomp:runtime] auto resume of %s failed: %s (booting normally)\n",
+                             best.c_str(), e.c_str());
+            }
+        }
+        clear_suspend_marker();
     } else if (opts.resume_suspend_state_on_launch) {
         // The previous session was suspended by the OS and never came back
         // (killed in the background, or swiped away): resume it.
@@ -4782,6 +5035,48 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     auto headless_playback_boundary = [&](char site) {
         const uint64_t frame = ppu.frame_count();
         if (frame == last_presented_frame) return;
+        // GBARECOMP_EWRAM_FRAMES=<file>: append the whole EWRAM at every playback frame
+        // boundary (offline RAM diffing, e.g. finding a game's map-transition variables).
+        static std::FILE* s_ewram_frames = [] {
+            const char* e = std::getenv("GBARECOMP_EWRAM_FRAMES");
+            return (e && *e) ? std::fopen(e, "wb") : static_cast<std::FILE*>(nullptr);
+        }();
+        if (s_ewram_frames) std::fwrite(bus.ewram_ptr(), 1, 0x40000, s_ewram_frames);
+        // GBARECOMP_POKE16="<frame>:<addr>=<value>[;...]": write guest u16s when playback reaches
+        // a frame (relative to the first playback frame); offline exploration only.
+        static std::vector<std::tuple<uint64_t, uint32_t, uint16_t>> s_pokes = [] {
+            std::vector<std::tuple<uint64_t, uint32_t, uint16_t>> v;
+            if (const char* e = std::getenv("GBARECOMP_POKE16")) {
+                std::string spec = e;
+                size_t p = 0;
+                while (p < spec.size()) {
+                    size_t q = spec.find(';', p);
+                    std::string item = spec.substr(p, q == std::string::npos ? std::string::npos : q - p);
+                    unsigned long long f = 0; unsigned a = 0, val = 0;
+                    if (std::sscanf(item.c_str(), "%llu:%x=%i", &f, &a, &val) == 3) v.emplace_back(f, a, static_cast<uint16_t>(val));
+                    if (q == std::string::npos) break;
+                    p = q + 1;
+                }
+            }
+            return v;
+        }();
+        // relative to the first frame of the playback (the replay checkpoint)
+        static uint64_t s_first_frame = 0;
+        if (s_first_frame == 0 && frame > 1) s_first_frame = frame;
+        for (const auto& [f, a, val] : s_pokes)
+            if (s_first_frame && frame - s_first_frame >= f && a >= 0x02000000u && a < 0x02040000u)
+                std::memcpy(bus.ewram_ptr() + (a - 0x02000000u), &val, 2);
+        static const uint64_t s_stop = [] {
+            const char* e = std::getenv("GBARECOMP_PLAYBACK_STOP");
+            return (e && *e) ? std::strtoull(e, nullptr, 0) : 0ull;
+        }();
+        if (s_stop && s_first_frame && frame - s_first_frame >= s_stop) host_quit = true;
+        if (s_first_frame) s_playback_rel_frame = frame - s_first_frame;
+        static std::FILE* s_iwram_frames = [] {
+            const char* e = std::getenv("GBARECOMP_IWRAM_FRAMES");
+            return (e && *e) ? std::fopen(e, "wb") : static_cast<std::FILE*>(nullptr);
+        }();
+        if (s_iwram_frames) std::fwrite(bus.iwram_ptr(), 1, 0x8000, s_iwram_frames);
         diag.frame_end();
         diag.frame_begin(site);
         last_presented_frame = frame;
@@ -4904,6 +5199,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 if (present_frame) present_live_frame();
                 // Framedump (capture runs only) is attributed to present_us.
                 if (framedump_dir && frame >= framedump_start &&
+                    (frame - framedump_start) % framedump_stride == 0 &&
                     framedump_written < framedump_max) {
                     char p[512];
                     std::snprintf(p, sizeof(p), "%s/f_%06llu.png", framedump_dir,
@@ -5050,6 +5346,44 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             std::fprintf(stderr, "Final diagnostic snapshot failed: %s\n", error.c_str());
             return 1;
         }
+    }
+
+    // GBARECOMP_MEM_DUMP_DIR=<dir>: raw EWRAM/VRAM/palette/IO at exit (offline map rendering).
+    if (const char* md = std::getenv("GBARECOMP_MEM_DUMP_DIR"); md && *md) {
+        auto put = [&](const char* name, const uint8_t* data, size_t n) {
+            std::ofstream f(std::string(md) + "/" + name, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+        };
+        put("ewram.bin", bus.ewram_ptr(), 0x40000);
+        put("vram.bin", bus.vram_ptr(), 0x18000);
+        put("pal.bin", bus.pal_ptr(), 0x400);
+        put("io.bin", bus.io().raw(), 0x400);
+    }
+    if (plane_dump_dir && *plane_dump_dir) {
+        const std::string dir = plane_dump_dir;
+        auto put = [&](const std::string& name, const uint8_t* data, size_t n) {
+            std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
+            if (data) f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+        };
+        const size_t pb = ppu.layered_plane_bytes();
+        const uint8_t* stock = ppu.latched_layered_3d();
+        const uint8_t* masked = ppu.latched_masked_3d();
+        if (const uint8_t* spr = gba::latched_sprite_layer()) {
+            put("sprite_layer.rgba", spr, pb);
+            const std::string d = std::to_string(gba::g_layered_sprite_depth_live);
+            put("sprite_depth.txt", reinterpret_cast<const uint8_t*>(d.data()), d.size());
+        }
+        for (unsigned p = 0; p < gba::GbaPpu::kLayeredPlanes; ++p) {
+            if (stock) put("stock_plane_" + std::to_string(p) + ".rgba", stock + p * pb, pb);
+            if (masked) put("plane_" + std::to_string(p) + ".rgba", masked + p * pb, pb);
+        }
+        if (ppu.has_latched_framebuffer())
+            put("composite.rgb", ppu.latched_framebuffer(), ppu.render_bytes());
+        std::ofstream info(dir + "/info.txt");
+        info << "w=" << ppu.render_width() << " h=" << ppu.render_height() << " stock=" << (stock ? 1 : 0)
+             << " masked=" << (masked ? 1 : 0) << " masked_scene=" << (ppu.latched_masked_scene() ? 1 : 0)
+             << " render_bytes=" << ppu.render_bytes() << "\n";
+        std::printf("plane dump -> %s (stock=%d masked=%d)\n", dir.c_str(), stock ? 1 : 0, masked ? 1 : 0);
     }
 
     if (!args.dump_bmp.empty() || !args.dump_png.empty()) {

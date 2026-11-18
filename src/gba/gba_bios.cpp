@@ -16,6 +16,7 @@ bool GbaBios::load_from_file(const std::string& path,
                              const std::string& expected_sha1,
                              std::string* err) {
     loaded_ = false;
+    hle_stub_ = false;
     sha1_hex_.clear();
 
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -54,6 +55,34 @@ bool GbaBios::load_from_file(const std::string& path,
 
     loaded_ = true;
     return true;
+}
+
+void GbaBios::load_hle_stub() {
+    bytes_.fill(0);
+    auto put32 = [&](uint32_t off, uint32_t word) {
+        bytes_[off + 0] = static_cast<uint8_t>(word & 0xFFu);
+        bytes_[off + 1] = static_cast<uint8_t>((word >> 8) & 0xFFu);
+        bytes_[off + 2] = static_cast<uint8_t>((word >> 16) & 0xFFu);
+        bytes_[off + 3] = static_cast<uint8_t>((word >> 24) & 0xFFu);
+    };
+    // Standard ARM7TDMI GBA IRQ vector (0x18 -> 0x128) and trampoline:
+    //   0x018: b     0x128
+    //   0x128: stmfd sp!, {r0-r3, r12, lr}
+    //   0x12C: mov   r0, #0x04000000
+    //   0x130: add   lr, pc, #0
+    //   0x134: ldr   pc, [r0, #-4]
+    //   0x138: ldmfd sp!, {r0-r3, r12, lr}
+    //   0x13C: subs  pc, lr, #4
+    put32(0x018, 0xEA000042u);
+    put32(0x128, 0xE92D500Fu);
+    put32(0x12C, 0xE3A00301u);
+    put32(0x130, 0xE28FE000u);
+    put32(0x134, 0xE510F004u);
+    put32(0x138, 0xE8BD500Fu);
+    put32(0x13C, 0xE25EF004u);
+    sha1_hex_ = "hle-stub";
+    hle_stub_ = true;
+    loaded_ = true;
 }
 
 uint8_t GbaBios::read8(uint32_t off) const {

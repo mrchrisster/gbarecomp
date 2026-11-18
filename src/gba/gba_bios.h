@@ -41,8 +41,13 @@ public:
                         const std::string& expected_sha1,
                         std::string* err);
 
+    // Populate a minimal public HLE stub (ARM IRQ vector 0x18 -> 0x128) so
+    // Quest / HLE-BIOS builds can run without a retail gba_bios.bin dump.
+    void load_hle_stub();
+
     // True if a valid BIOS image is loaded.
     bool loaded() const { return loaded_; }
+    bool hle_stub() const { return hle_stub_; }
 
     // SHA-1 hex of the loaded BIOS bytes (set after a successful
     // load).
@@ -57,6 +62,7 @@ public:
 
 private:
     bool loaded_ = false;
+    bool hle_stub_ = false;
     std::array<uint8_t, kSize> bytes_{};
     std::string sha1_hex_;
 };
