@@ -4315,6 +4315,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         opts.resume_suspend_state_on_launch && args.window &&
         args.tcp_port <= 0 && args.load_state.empty() &&
         !input_replay_requested && args.replay_diagnostic.empty();
+    const bool snapshot_on_flush =
+        opts.snapshot_on_battery_flush &&
+        opts.resume_suspend_state_on_launch && args.window &&
+        args.tcp_port <= 0 && args.load_state.empty() &&
+        !input_replay_requested && args.replay_diagnostic.empty();
     const uint64_t autosave_interval_frames = autosave_on
         ? static_cast<uint64_t>(opts.autosave_interval_seconds) * 60u : 0;
     uint64_t next_autosave_frame = ppu.frame_count() + autosave_interval_frames;
@@ -4356,7 +4361,13 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             // A resumed snapshot restores its own save RAM, which the next
             // flush writes back to disk. Refresh the snapshot with every
             // battery flush so resuming can never roll back a newer save.
-            if (autosave_on) autosave_now(frame);
+            if (autosave_on || snapshot_on_flush) {
+                autosave_now(frame);
+                if (snapshot_on_flush) {
+                    std::printf("flush_snapshot frame=%llu\n", static_cast<unsigned long long>(frame));
+                    std::fflush(stdout);
+                }
+            }
         }
     };
 #if defined(GBARECOMP_WEB_HOST)

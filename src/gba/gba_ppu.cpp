@@ -45,6 +45,8 @@ extern "C" int g_layered_fog_alpha = 0;
 extern "C" float g_layered_split_push = 0.0f;
 extern "C" void (*g_layered_bg_split_row)(int bg, int y, const uint8_t* io, const uint8_t* vram,
                                           uint8_t* out, int width) = nullptr;
+extern "C" void (*g_layered_bg_hide_row)(int bg, int y, const uint8_t* io, const uint8_t* vram,
+                                          uint8_t* out, int width) = nullptr;
 extern "C" float g_layered_sprite_depth = 3.5f;
 extern "C" float g_layered_sprite_depth_live = 3.5f;
 extern "C" float g_layered_parallax_depth = 0.0f;
@@ -58,6 +60,7 @@ extern "C" void (*g_ws_frame_start)() = nullptr;
 // world — used for non-overworld screens (menus, battles, transitions) so they
 // are letterboxed rather than garbled. Set per-frame by the runtime policy.
 extern "C" int g_ws_pillarbox = 0;
+extern "C" int g_ws_margin_window_clamp = 0;
 extern "C" int g_ws_pillarbox_left = 0;
 extern "C" int g_ws_pillarbox_right = 0;
 extern "C" int (*g_ws_obj_x_provider)(int, int*) = nullptr;
@@ -1033,6 +1036,8 @@ static std::vector<LayeredCandidate> s_sprite_row;
 // into a gameplay layer; it goes one plane further back (unless that plane is parallax-pushed).
 static uint8_t s_split_row[4][GbaPpu::kMaxRenderWidth];
 static bool s_split_active[4] = {};
+static uint8_t s_hide_row[4][GbaPpu::kMaxRenderWidth];
+static bool s_hide_active[4] = {};
 
 void assign_layered_bucket(std::vector<LayeredCandidate>& bucket_top,
                            std::vector<LayeredCandidate>& bucket_second,
@@ -1044,6 +1049,10 @@ void assign_layered_bucket(std::vector<LayeredCandidate>& bucket_top,
         if (s_sprite_row.size() != width) s_sprite_row.assign(width, LayeredCandidate{});
         if (cand.key < s_sprite_row[x].key) s_sprite_row[x] = cand;
         return;
+    }
+    if (cand.layer < 4 && s_hide_active[cand.layer] && x < GbaPpu::kMaxRenderWidth &&
+        s_hide_row[cand.layer][x]) {
+        return;  // art the GBA never shows (game hook)
     }
     uint32_t plane = 0;
     if (cand.layer != 5 && cand.key < 0x70000000) {
@@ -2409,6 +2418,10 @@ void render_scanline_wide(uint8_t* rgb, int y, uint16_t dispcnt,
                 return window_control_at_hx(hx);
             return window_control_is_uniform ? uniform_window_control : 0u;
         }
+        // Opt-in (g_ws_margin_window_clamp): margins take the window control of the nearest
+        // native column, so a full-width WIN0 keeps the world visible beyond the screen edge.
+        if (g_ws_margin_window_clamp && (hx < 0 || hx >= static_cast<int>(kVanW)))
+            return window_control_at_hx(std::clamp(hx, 0, static_cast<int>(kVanW) - 1));
         return window_control_at_hx(hx);
     };
     // Every later compositor stage asks the same window questions for the
@@ -4387,6 +4400,14 @@ void GbaPpu::render_scanline(uint32_t y,
     if (layered_3d_) {
         if (y == 0) choose_obj_plane_prio(oam);
         update_layered_rank(dispcnt, io);
+        for (int i = 0; i < 4; ++i) {
+            s_hide_active[i] = false;
+            if (g_layered_bg_hide_row && !s_flat_scene && (dispcnt & 7u) == 0 && (dispcnt & (0x100u << i))) {
+                std::memset(s_hide_row[i], 0, kScreenWidth);
+                g_layered_bg_hide_row(i, static_cast<int>(y), io, vram, s_hide_row[i], static_cast<int>(kScreenWidth));
+                s_hide_active[i] = true;
+            }
+        }
         for (int i = 0; i < 4; ++i) {
             s_split_active[i] = false;
             const int bg_prio = (io[0x08 + 2 * i] | (io[0x09 + 2 * i] << 8)) & 3;

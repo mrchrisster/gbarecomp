@@ -389,6 +389,10 @@ extern "C" float g_layered_split_push;
 // (not gameplay terrain); those go one plane further back. io/vram are this scanline's.
 extern "C" void (*g_layered_bg_split_row)(int bg, int y, const uint8_t* io, const uint8_t* vram,
                                           uint8_t* out, int width);
+// STOCK 3D game hook: out[x] = 1 drops BG `bg`'s pixel on row y from the planes entirely (art the
+// GBA never shows, e.g. placeholder tiles kept covered by a front layer). Called for every BG.
+extern "C" void (*g_layered_bg_hide_row)(int bg, int y, const uint8_t* io, const uint8_t* vram,
+                                         uint8_t* out, int width);
 extern "C" float g_layered_sprite_depth;       // < 0 = automatic (see gba_ppu.cpp)
 extern "C" float g_layered_sprite_depth_live;  // depth the host shows this frame
 const uint8_t* latched_sprite_layer();
@@ -408,6 +412,7 @@ extern "C" int g_ws_native_view_top;
 // and VRAM state that frame shows: a game can place the native view here.
 extern "C" void (*g_ws_frame_start)();
 extern "C" int g_ws_pillarbox;  // Step C policy: black margins on non-field screens
+extern "C" int g_ws_margin_window_clamp;  // margins use the nearest native column's window control
 extern "C" int g_ws_pillarbox_left;
 extern "C" int g_ws_pillarbox_right;
 // Optional per-game interpretation of the 9-bit OBJ X field in expanded-view

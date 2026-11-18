@@ -117,6 +117,9 @@ struct RunOptions {
     // save slots 1-10 (marker or not). Env GBARECOMP_AUTO_RESUME=0 (a host menu toggle) disables
     // all launch resume, so the game boots fresh.
     bool resume_newest_state_on_launch = false;
+    // With resume_suspend_state_on_launch: every battery (SRAM) flush also writes the suspend
+    // state + marker, so the resume point follows the game's own saves (no timed autosave needed).
+    bool snapshot_on_battery_flush = false;
 
     // Device orientation policy on platforms that rotate (Android). Landscape
     // is the historical default; Any follows the sensor with live re-layout.

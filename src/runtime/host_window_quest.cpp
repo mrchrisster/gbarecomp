@@ -458,6 +458,11 @@ struct Backend {
     // GBARECOMP_XR_WINDOW=1: far planes (0,1) drawn per eye, clipped to the window opening.
     bool window_clip = false;
     bool start_dark = false;
+    // GBARECOMP_XR_MARGIN_RENDER=1: the runtime renders `pad` real columns beyond each side of the
+    // 240 px screen (wider view); they fill the shadow-box margins instead of stretched edge pixels.
+    int wide_margin = 0;
+    std::vector<uint8_t> staging_margin, xr_margin;  // [plane][row][2*wide_margin] RGBA, raw
+    std::vector<uint8_t> wide_plane;
     bool auto_resume = true;  // menu AUTO RESUME: launch loads the newest state (runtime reads GBARECOMP_AUTO_RESUME)  // GBARECOMP_XR_DARK=1: start with the room (passthrough) off
     bool window_failed = false;
     WindowRenderer winr;
@@ -2456,6 +2461,7 @@ void render_xr_frame(Backend& b) {
                 } else {
                     b.xr_masked_pixels.clear();
                 }
+                b.xr_margin.swap(b.staging_margin);
                 b.xr_w = b.staging_w;
                 b.xr_h = b.staging_h;
                 b.xr_planes = b.staging_planes;
@@ -2706,7 +2712,37 @@ void render_xr_frame(Backend& b) {
                             continue;
                         }
                         bool blitted = false;
-                        if (b.pad > 0) {
+                        const int mw = b.wide_margin;
+                        const bool real_margin = b.pad > 0 && mw == b.pad && p < kLayeredPlaneCount &&
+                                                 b.xr_margin.size() >= static_cast<size_t>(p + 1) * ih * 2 * mw * 4;
+                        if (real_margin) {
+                            // Real level columns left/right (rendered wide), mirrored rows top/bottom.
+                            const int ww = iw + 2 * mw;
+                            b.wide_plane.resize(static_cast<size_t>(ww) * ih * 4);
+                            const uint8_t* srcp = plane_src + p * plane_bytes;
+                            for (int y = 0; y < ih; ++y) {
+                                uint8_t* d = b.wide_plane.data() + static_cast<size_t>(y) * ww * 4;
+                                const uint8_t* mrow = b.xr_margin.data() + (static_cast<size_t>(p) * ih + y) * 2 * mw * 4;
+                                std::memcpy(d, mrow, mw * 4);
+                                std::memcpy(d + mw * 4, srcp + static_cast<size_t>(y) * iw * 4, static_cast<size_t>(iw) * 4);
+                                std::memcpy(d + (mw + iw) * 4, mrow + mw * 4, mw * 4);
+                            }
+                            bool vis2 = false;
+                            flip_and_grade_rgba_plane(b, b.wide_plane.data(), ww, ih, &vis2, p > 0);
+                            const int pw = ww, ph = ih + 2 * b.pad;
+                            b.pad_fb.assign(static_cast<size_t>(pw) * ph * 4, 0);
+                            for (int y = 0; y < ph; ++y) {
+                                int sy = y - b.pad;  // mirror at the top and bottom edge
+                                if (sy < 0) sy = -1 - sy;
+                                if (sy >= ih) sy = 2 * ih - 1 - sy;
+                                sy = std::clamp(sy, 0, ih - 1);
+                                std::memcpy(b.pad_fb.data() + static_cast<size_t>(y) * pw * 4,
+                                            b.rgba_fb.data() + static_cast<size_t>(sy) * ww * 4, static_cast<size_t>(pw) * 4);
+                            }
+                            blitted = blit_rgba_to_swapchain(b, p, pw, ph, b.pad_fb.data(), true);
+                            if (b.window_clip && b.winr.ready())
+                                b.winr.upload(static_cast<int>(p), b.pad_fb.data(), pw, ph, b.swapchain_srgb);
+                        } else if (b.pad > 0) {
                             // Edge-extend the GBA planes into the margin (the frame hides the
                             // seam); the separate sprite layer (index 5) gets a clear margin.
                             const int pw = iw + 2 * b.pad, ph = ih + 2 * b.pad;
@@ -2860,7 +2896,7 @@ void render_xr_frame(Backend& b) {
                         wait.timeout = XR_INFINITE_DURATION;
                         if (XR_SUCCEEDED(xrWaitSwapchainImage(b.frame_swapchain, &wait))) {
                             std::vector<uint8_t> px(16 * 16 * 4);
-                            for (size_t i = 0; i < px.size(); i += 4) { px[i] = 14; px[i + 1] = 16; px[i + 2] = 22; px[i + 3] = 255; }
+                            for (size_t i = 0; i < px.size(); i += 4) { px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 255; }  // = the dark void
                             glBindTexture(GL_TEXTURE_2D, b.frame_images[fi].image);
                             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
                             glBindTexture(GL_TEXTURE_2D, 0);
@@ -2877,7 +2913,7 @@ void render_xr_frame(Backend& b) {
                 const float cx[4] = {0.0f, 0.0f, -(w + bw) * 0.5f, (w + bw) * 0.5f};
                 const float cy[4] = {(h + bw) * 0.5f, -(h + bw) * 0.5f, 0.0f, 0.0f};
                 const float sx[4] = {w + 2.0f * bw, w + 2.0f * bw, bw, bw};
-                const float sy[4] = {bw, bw, h, h};
+                const float sy[4] = {bw, bw, h + 2.0f * bw, h + 2.0f * bw};  // sides overlap the corners: no seams
                 for (int i = 0; i < 4; ++i) {
                     XrCompositionLayerQuad& f = frame_quads[i];
                     f = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -3304,9 +3340,41 @@ void stage_frame(Backend& b, const uint8_t* src_pixels, unsigned src_w, unsigned
                  unsigned plane_count = 1, bool is_rgba_planes = false,
                  const uint8_t* masked_planes_rgba = nullptr, bool masked_scene = false) {
     if (!src_pixels || src_w == 0 || src_h == 0) return;
+    std::lock_guard<std::mutex> lk(b.frame_mtx);
+    const unsigned m = static_cast<unsigned>(b.wide_margin);
+    if (m > 0 && is_rgba_planes && src_w > 2 * m &&
+        src_w - 2 * m == static_cast<unsigned>(b.requested_base_w.load(std::memory_order_acquire))) {
+        // Wide render: keep the 240 px screen as the frame, the side columns as margin data.
+        const unsigned nw = src_w - 2 * m, planes = std::max(1u, plane_count);
+        const uint8_t* margin_src = (masked_planes_rgba && masked_scene) ? masked_planes_rgba : src_pixels;
+        b.staging_pixels.resize(static_cast<size_t>(nw) * src_h * 4 * planes);
+        b.staging_masked_pixels.resize(masked_planes_rgba && masked_scene ? b.staging_pixels.size() : 0);
+        b.staging_margin.resize(static_cast<size_t>(2 * m) * src_h * 4 * planes);
+        for (unsigned p = 0; p < planes; ++p) {
+            for (unsigned y = 0; y < src_h; ++y) {
+                const size_t srow = (static_cast<size_t>(p) * src_h + y) * src_w * 4;
+                const size_t drow = (static_cast<size_t>(p) * src_h + y) * nw * 4;
+                std::memcpy(b.staging_pixels.data() + drow, src_pixels + srow + m * 4, nw * 4);
+                if (!b.staging_masked_pixels.empty())
+                    std::memcpy(b.staging_masked_pixels.data() + drow, masked_planes_rgba + srow + m * 4, nw * 4);
+                uint8_t* mrow = b.staging_margin.data() + (static_cast<size_t>(p) * src_h + y) * 2 * m * 4;
+                std::memcpy(mrow, margin_src + srow, m * 4);
+                std::memcpy(mrow + m * 4, margin_src + srow + (m + nw) * 4, m * 4);
+            }
+        }
+        b.staging_has_masked = !b.staging_masked_pixels.empty();
+        b.staging_hdbg_ok = gbarecomp::hdbg::snapshot(b.staging_hdbg);
+        b.staging_w = nw;
+        b.staging_h = src_h;
+        b.staging_planes = plane_count;
+        b.staging_is_rgba = true;
+        b.staging_masked_scene = masked_scene;
+        ++b.pending_seq;
+        return;
+    }
+    b.staging_margin.clear();
     const size_t plane_bytes = static_cast<size_t>(src_w) * src_h * (is_rgba_planes ? 4u : 3u);
     const size_t total_bytes = plane_bytes * std::max(1u, plane_count);
-    std::lock_guard<std::mutex> lk(b.frame_mtx);
     b.staging_pixels.assign(src_pixels, src_pixels + total_bytes);
     if (is_rgba_planes && masked_planes_rgba && masked_scene) {
         b.staging_masked_pixels.assign(masked_planes_rgba, masked_planes_rgba + total_bytes);
@@ -3351,6 +3419,13 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     if (const char* e = std::getenv("GBARECOMP_XR_BOXWALLS")) b->box_walls = (*e == '1');
     if (const char* e = std::getenv("GBARECOMP_XR_WINDOW")) b->window_clip = (*e == '1');
     if (const char* e = std::getenv("GBARECOMP_XR_DARK")) b->start_dark = (*e == '1');
+    if (const char* e = std::getenv("GBARECOMP_XR_MARGIN_RENDER"); e && *e == '1' && b->pad > 0 &&
+        b->base_w > 2 * b->pad) {
+        // The runtime renders 240 + 2*pad wide; the screen itself stays 240 px.
+        b->wide_margin = b->pad;
+        b->base_w -= 2 * b->pad;
+        b->requested_base_w.store(b->base_w, std::memory_order_release);
+    }
     load_xr_prefs(*b);
     setenv("GBARECOMP_AUTO_RESUME", b->auto_resume ? "1" : "0", 1);
     if (const char* e = std::getenv("GBARECOMP_XR_TITLE"); e && *e) b->hud_title = e;
