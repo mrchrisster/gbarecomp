@@ -90,6 +90,14 @@ constexpr uint32_t target_swapchain_scale(int base_w) {
 constexpr float kThumbstickDeadzone = 0.32f;
 constexpr float kTriggerThreshold = 0.45f;
 constexpr float kGripThreshold = 0.55f;
+// Cartridge gyro from Touch controller wrist twist (opt-in GBARECOMP_XR_GYRO=1, WarioWare: Twisted!).
+constexpr float kGyroDriftDeadzoneRadPerSec = 0.025f;
+// 1.00X in the menu = a quarter of the v0.1 response (players found v0.1 far too twitchy for the
+// precise microgames; Christoph found a quarter right). 4.00X = the v0.1 response.
+constexpr float kQuestGyroRateScale = 0.5f;
+constexpr float kGyroSensSteps[] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f, 3.0f, 4.0f};
+constexpr int kGyroSensCount = static_cast<int>(sizeof(kGyroSensSteps) / sizeof(kGyroSensSteps[0]));
+constexpr int kGyroSensDefault = 3;
 
 struct Quat {
     float x = 0.0f, y = 0.0f, z = 0.0f, w = 1.0f;
@@ -418,6 +426,13 @@ struct Backend {
     std::atomic<bool> exit_requested{false};
     std::atomic<bool> background_pending{false};
     std::atomic<uint16_t> latest_keyinput{0x03FFu};
+    // Cartridge gyro (GBARECOMP_XR_GYRO=1): angular rate of the active controller around the
+    // forearm axis, handed to the runtime as ev.gyro_rate_z. Hand + sensitivity are menu items.
+    bool gyro_enabled = false;
+    int active_gyro_hand = 1;  // 1 = right (default), 0 = left
+    int gyro_sens_idx = kGyroSensDefault;
+    bool gyro_motion_logged = false;
+    std::atomic<float> latest_gyro_rate_z{0.0f};
 
     // Layered GBA swapchains & images (0..4 in STOCK 3D; 0..6 with P3a/b/c actor bands in MASKED 3D)
     XrSwapchain screen_swapchains[kMaskedQuadCount] = {};
@@ -926,7 +941,8 @@ static void save_xr_prefs(const Backend& b) {
     if (p.empty()) return;
     if (std::FILE* f = std::fopen(p.c_str(), "w")) {
         const bool dark = b.passthrough_supported ? (b.hud_mode == 2) : b.start_dark;
-        std::fprintf(f, "%d %d %d\n", b.window_clip ? 1 : 0, dark ? 1 : 0, b.auto_resume ? 1 : 0);
+        std::fprintf(f, "%d %d %d %d %d\n", b.window_clip ? 1 : 0, dark ? 1 : 0, b.auto_resume ? 1 : 0,
+                     static_cast<int>(std::lround(kGyroSensSteps[b.gyro_sens_idx] * 100.0f)), b.active_gyro_hand);
         std::fclose(f);
         XR_LOGI("prefs saved: window %d dark %d", b.window_clip ? 1 : 0, dark ? 1 : 0);
     }
@@ -936,8 +952,13 @@ static void load_xr_prefs(Backend& b) {
     const std::string p = xr_prefs_path();
     if (p.empty()) return;
     if (std::FILE* f = std::fopen(p.c_str(), "r")) {
-        int w = 0, d = 0, r = 1;
-        if (std::fscanf(f, "%d %d %d", &w, &d, &r) >= 2) {
+        int w = 0, d = 0, r = 1, g = kGyroSensDefault, h = 1;
+        if (std::fscanf(f, "%d %d %d %d %d", &w, &d, &r, &g, &h) >= 2) {
+            // Field 4 = sensitivity in percent of the menu's 1.00X (small values = an older
+            // index format with another scale: ignored).
+            for (int i = 0; i < kGyroSensCount; ++i)
+                if (g >= 10 && std::lround(kGyroSensSteps[i] * 100.0f) == g) b.gyro_sens_idx = i;
+            b.active_gyro_hand = h == 0 ? 0 : 1;
             b.window_clip = w == 1;
             b.start_dark = d == 1;
             b.auto_resume = r != 0;
@@ -1137,10 +1158,19 @@ void upload_hud_image(Backend& b) {
 }
 
 // ---- VR options menu (GBARECOMP_XR_MENU=1) ----
-enum MenuItem { kMenuResume, kMenuSave, kMenuLoad, kMenuDepth, kMenuBackground, kMenuEdges, kMenuAutoResume, kMenuRecenter, kMenuResetView, kMenuCount };
+enum MenuItem { kMenuResume, kMenuSave, kMenuLoad, kMenuDepth, kMenuGyro, kMenuGyroHand, kMenuBackground, kMenuEdges, kMenuAutoResume, kMenuRecenter, kMenuResetView, kMenuCount };
 
 int menu_depth_index(const Backend& b) { return b.depth_mode == 0 ? 2 : (b.stock_deep ? 1 : 0); }
 const char* menu_depth_name(int i) { return i == 0 ? "NORMAL 3D" : (i == 1 ? "DEEP 3D" : "FLAT 2D"); }
+// GYRO SENSITIVITY only exists for games with the cartridge gyro.
+bool menu_item_visible(const Backend& b, int i) {
+    return (i != kMenuGyro && i != kMenuGyroHand) || b.gyro_enabled;
+}
+int menu_visible_count(const Backend& b) {
+    int n = 0;
+    for (int i = 0; i < kMenuCount; ++i) n += menu_item_visible(b, i) ? 1 : 0;
+    return n;
+}
 const char* menu_background_name(const Backend& b) {
     if (!b.passthrough_supported) return "DARK";
     return b.hud_mode == 2 ? "DARK" : "ROOM";  // the help bar is not shown with the menu
@@ -1211,15 +1241,21 @@ void upload_menu_image(Backend& b) {
     }
     char slot[32];
     std::snprintf(slot, sizeof(slot), "SLOT %d", b.menu_slot);
+    char gyro[16];
+    std::snprintf(gyro, sizeof(gyro), "%.2fX", static_cast<double>(kGyroSensSteps[b.gyro_sens_idx]));
     const char* labels[kMenuCount] = {"RESUME", "SAVE STATE", "LOAD STATE", "3D DEPTH",
-                                      "BACKGROUND", "EDGES", "AUTO RESUME", "RECENTER SCREEN", "RESET SCREEN SIZE"};
-    const char* values[kMenuCount] = {"", slot, slot, menu_depth_name(menu_depth_index(b)),
+                                      "GYRO SENSITIVITY", "GYRO HAND", "BACKGROUND", "EDGES", "AUTO RESUME", "RECENTER SCREEN", "RESET SCREEN SIZE"};
+    const char* values[kMenuCount] = {"", slot, slot, menu_depth_name(menu_depth_index(b)), gyro,
+                                      b.active_gyro_hand == 1 ? "RIGHT" : "LEFT",
                                       menu_background_name(b), b.window_clip ? "WINDOW" : "SHADOW BOX",
                                       b.auto_resume ? "ON" : "OFF", "", ""};
+    const int row_h = menu_visible_count(b) > 9 ? 40 : 50;
+    int row = 0;
     for (int i = 0; i < kMenuCount; ++i) {
-        const int y = 178 + i * 50;
+        if (!menu_item_visible(b, i)) continue;
+        const int y = 178 + (row++) * row_h;
         const bool sel = i == b.menu_sel;
-        if (sel) menu_fill(rgba, 20, y - 6, kMenuWidth - 40, 46, 0xFAD23CFFu);
+        if (sel) menu_fill(rgba, 20, y - 6, kMenuWidth - 40, row_h - 4, 0xFAD23CFFu);
         const uint32_t fg = sel ? 0x10141CFFu : 0xFFFFFFFFu;
         draw_hud_text(rgba, kMenuWidth, kMenuHeight, 44, y, 5, fg, labels[i]);
         if (values[i][0]) {
@@ -1920,6 +1956,7 @@ void flip_and_grade_rgba_plane(Backend& b, const uint8_t* plane_rgba, int iw, in
 void poll_xr_actions(Backend& b) {
     if (!b.actions_attached || b.session_state != XR_SESSION_STATE_FOCUSED) {
         b.latest_keyinput.store(0x03FFu, std::memory_order_release);
+        b.latest_gyro_rate_z.store(0.0f, std::memory_order_release);
         return;
     }
 
@@ -2022,7 +2059,9 @@ void poll_xr_actions(Backend& b) {
                 b.pending_pause_toggles.fetch_add(1, std::memory_order_acq_rel);
             };
             if (dir_y != 0 && dir_y != b.menu_prev_dir_y) {
-                b.menu_sel = (b.menu_sel + (dir_y > 0 ? kMenuCount - 1 : 1)) % kMenuCount;
+                do {
+                    b.menu_sel = (b.menu_sel + (dir_y > 0 ? kMenuCount - 1 : 1)) % kMenuCount;
+                } while (!menu_item_visible(b, b.menu_sel));
                 b.menu_status.clear();
                 b.menu_dirty = true;
                 trigger_haptic_ns(b, 1, 8000000LL, 0.2f);
@@ -2030,6 +2069,13 @@ void poll_xr_actions(Backend& b) {
             if (dir_x != 0 && dir_x != b.menu_prev_dir_x) {
                 if (b.menu_sel == kMenuSave || b.menu_sel == kMenuLoad) {
                     b.menu_slot = (b.menu_slot - 1 + (dir_x > 0 ? 1 : 2)) % 3 + 1;
+                } else if (b.menu_sel == kMenuGyro) {
+                    b.gyro_sens_idx = std::clamp(b.gyro_sens_idx + (dir_x > 0 ? 1 : -1), 0, kGyroSensCount - 1);
+                    save_xr_prefs(b);
+                } else if (b.menu_sel == kMenuGyroHand) {
+                    b.active_gyro_hand = 1 - b.active_gyro_hand;
+                    trigger_haptic_ns(b, b.active_gyro_hand, 30000000LL, 0.5f);
+                    save_xr_prefs(b);
                 } else if (b.menu_sel == kMenuDepth) {
                     const int d = (menu_depth_index(b) + (dir_x > 0 ? 1 : 2)) % 3;
                     b.depth_mode = d == 2 ? 0 : 1;
@@ -2091,6 +2137,15 @@ void poll_xr_actions(Backend& b) {
                         break;
                     case kMenuEdges:
                         b.window_clip = !b.window_clip;
+                        save_xr_prefs(b);
+                        break;
+                    case kMenuGyro:
+                        b.gyro_sens_idx = (b.gyro_sens_idx + 1) % kGyroSensCount;
+                        save_xr_prefs(b);
+                        break;
+                    case kMenuGyroHand:
+                        b.active_gyro_hand = 1 - b.active_gyro_hand;
+                        trigger_haptic_ns(b, b.active_gyro_hand, 30000000LL, 0.5f);
                         save_xr_prefs(b);
                         break;
                     case kMenuRecenter:
@@ -2190,6 +2245,38 @@ void poll_xr_actions(Backend& b) {
         trigger_haptic_ns(b, 0, 20000000LL, 0.35f);
     }
     b.prev_l_menu_click = l_menu;
+
+    if (b.gyro_enabled) {
+        XrSpaceVelocity vel{XR_TYPE_SPACE_VELOCITY};
+        XrSpaceLocation hand_loc{XR_TYPE_SPACE_LOCATION, &vel};
+        const XrSpace active_space = b.aim_spaces[b.active_gyro_hand];
+        if (!both_grips && !b.menu_open && active_space != XR_NULL_HANDLE &&
+            XR_SUCCEEDED(xrLocateSpace(active_space, b.local_space, pose_time, &hand_loc)) &&
+            (hand_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+            (vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)) {
+            // Forearm pronation/supination axis in controller aim space (tilted slightly toward
+            // the handle so twisting works pointing at the screen, lying down or holding the
+            // controller upright) + screen-normal projection for flat steering twists.
+            const XrVector3f wrist_axis = v3_norm(
+                rotate_vec(hand_loc.pose.orientation, 0.0f, -0.26f, 0.965f), {0.0f, 0.0f, 1.0f});
+            const XrVector3f screen_normal = v3_norm(
+                rotate_vec(b.screen_pose.orientation, 0.0f, 0.0f, 1.0f), wrist_axis);
+            const float rate_wrist = v3_dot(vel.angularVelocity, wrist_axis);
+            const float rate_screen = v3_dot(vel.angularVelocity, screen_normal);
+            const float rate_z = (std::abs(rate_wrist) >= std::abs(rate_screen) * 0.75f)
+                                     ? rate_wrist : rate_screen;
+            const float filtered = (std::abs(rate_z) >= kGyroDriftDeadzoneRadPerSec) ? rate_z : 0.0f;
+            b.latest_gyro_rate_z.store(filtered * kQuestGyroRateScale * kGyroSensSteps[b.gyro_sens_idx],
+                                       std::memory_order_release);
+            if (filtered != 0.0f && !b.gyro_motion_logged) {
+                XR_LOGI("Quest Touch gyro active: hand=%s rate_z=%.3f rad/s",
+                        b.active_gyro_hand == 1 ? "RIGHT" : "LEFT", static_cast<double>(rate_z));
+                b.gyro_motion_logged = true;
+            }
+        } else {
+            b.latest_gyro_rate_z.store(0.0f, std::memory_order_release);
+        }
+    }
 }
 
 void process_pending_haptics(Backend& b) {
@@ -3414,6 +3501,7 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     b->color_lut = std::make_unique<runtime::ColorLut>(parse_color_settings(screen));
     load_xr_view(*b);
     if (const char* e = std::getenv("GBARECOMP_XR_MENU")) b->menu_enabled = (*e == '1');
+    if (const char* e = std::getenv("GBARECOMP_XR_GYRO")) b->gyro_enabled = (*e == '1');
     if (b->menu_enabled) b->hud_mode = 1;  // controls are in the menu: no help bar
     if (const char* e = std::getenv("GBARECOMP_XR_SHADOWBOX")) b->pad = std::clamp(std::atoi(e), 0, 64);
     if (const char* e = std::getenv("GBARECOMP_XR_BOXWALLS")) b->box_walls = (*e == '1');
@@ -3723,6 +3811,7 @@ HostWindow::Events HostWindow::pump() {
     }
 
     ev.keyinput = b->latest_keyinput.load(std::memory_order_acquire);
+    if (b->gyro_enabled) ev.gyro_rate_z = b->latest_gyro_rate_z.load(std::memory_order_acquire);
     ev.save_slot = b->pending_save_slot.exchange(0, std::memory_order_acq_rel);
     ev.load_slot = b->pending_load_slot.exchange(0, std::memory_order_acq_rel);
     if (b->pending_pause_toggles.load(std::memory_order_acquire) > 0) {

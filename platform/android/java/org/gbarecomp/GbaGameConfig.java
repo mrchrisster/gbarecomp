@@ -26,6 +26,10 @@ public final class GbaGameConfig {
     public final String payloadVersion;
     public final String setupNote;
     public final boolean showGyroStatus;
+    /** Show the optional-BIOS card on the setup screen (always shown when required). */
+    public final boolean showBiosPrompt;
+    /** Go straight to the game once the files are imported (no setup screen). */
+    public final boolean skipSetupWhenReady;
 
     private GbaGameConfig(Bundle m) {
         title = string(m, "gbarecomp.title", "gbarecomp");
@@ -43,6 +47,10 @@ public final class GbaGameConfig {
         payloadVersion = string(m, "gbarecomp.payload_version", "1");
         setupNote = string(m, "gbarecomp.setup_note", "");
         showGyroStatus = Boolean.parseBoolean(string(m, "gbarecomp.gyro", "false"));
+        showBiosPrompt = biosRequired ||
+            Boolean.parseBoolean(string(m, "gbarecomp.bios_prompt", "true"));
+        skipSetupWhenReady = Boolean.parseBoolean(
+            string(m, "gbarecomp.skip_setup_when_ready", "false"));
     }
 
     private static String string(Bundle m, String key, String fallback) {

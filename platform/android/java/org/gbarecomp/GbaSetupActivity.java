@@ -53,6 +53,9 @@ public class GbaSetupActivity extends Activity {
     /** Validation/launcher-shortcut extra: start the game when ready without
      *  changing the player's skip-this-screen preference. */
     public static final String EXTRA_AUTOSTART = "org.gbarecomp.extra.AUTOSTART";
+    /** Force the setup screen even when the files are already verified, so
+     *  the player can re-pick them (adb: --ez org.gbarecomp.extra.SHOW_SETUP true). */
+    public static final String EXTRA_SHOW_SETUP = "org.gbarecomp.extra.SHOW_SETUP";
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private GbaGameConfig config;
@@ -84,6 +87,12 @@ public class GbaSetupActivity extends Activity {
             onBundledAssets();
             return;
         }
+        // Files were imported on an earlier launch: go straight to the game and
+        // drop this screen so it never sits under the game (singleTask relaunch).
+        if (shouldSkipSetup(getIntent())) {
+            startGameAndFinish();
+            return;
+        }
         setContentView(buildContent());
         enterImmersiveMode();
         refreshStatus();
@@ -93,6 +102,26 @@ public class GbaSetupActivity extends Activity {
         } else if (skipLauncherOnBoot()) {
             launchGame();
         }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (shouldSkipSetup(intent)) startGameAndFinish();
+    }
+
+    private boolean shouldSkipSetup(Intent intent) {
+        if (!config.skipSetupWhenReady) return false;
+        if (intent != null && intent.getBooleanExtra(EXTRA_SHOW_SETUP, false)) return false;
+        boolean rom = romFile().isFile() && romFile().length() == config.romSize;
+        boolean bios = biosFile().isFile() && biosFile().length() == BIOS_SIZE;
+        return rom && (bios || !config.biosRequired);
+    }
+
+    private void startGameAndFinish() {
+        startActivity(new Intent(this, gameActivityClass()));
+        finish();
     }
 
     @Override
@@ -231,19 +260,24 @@ public class GbaSetupActivity extends Activity {
         assets.addView(romCard, vertical ? margins(-1, -2, 0, dp(6), 0, dp(6))
                                          : weightedMargins(1, dp(8), 0, dp(8), 0));
 
-        LinearLayout biosCard = assetCard("2",
-            config.biosRequired ? "GBA BIOS" : "GBA BIOS (optional)",
-            config.biosRequired
-                ? "Choose your clean 16 KiB gba_bios.bin dump."
-                : "Recommended for accuracy. Without it the built-in BIOS " +
-                  "substitute is used.");
-        biosStatus = statusText();
-        biosButton = actionButton("CHOOSE BIOS");
-        biosButton.setOnClickListener(view -> pickFile(PICK_BIOS));
-        biosCard.addView(biosStatus, margins(-1, -2, 0, dp(4), 0, dp(4)));
-        biosCard.addView(biosButton, margins(-1, dp(48), 0, 0, 0, 0));
-        assets.addView(biosCard, vertical ? margins(-1, -2, 0, dp(6), 0, dp(6))
-                                          : weightedMargins(1, dp(8), 0, dp(8), 0));
+        if (config.showBiosPrompt) {
+            LinearLayout biosCard = assetCard("2",
+                config.biosRequired ? "GBA BIOS" : "GBA BIOS (optional)",
+                config.biosRequired
+                    ? "Choose your clean 16 KiB gba_bios.bin dump."
+                    : "Recommended for accuracy. Without it the built-in BIOS " +
+                      "substitute is used.");
+            biosStatus = statusText();
+            biosButton = actionButton("CHOOSE BIOS");
+            biosButton.setOnClickListener(view -> pickFile(PICK_BIOS));
+            biosCard.addView(biosStatus, margins(-1, -2, 0, dp(4), 0, dp(4)));
+            biosCard.addView(biosButton, margins(-1, dp(48), 0, 0, 0, 0));
+            assets.addView(biosCard, vertical ? margins(-1, -2, 0, dp(6), 0, dp(6))
+                                              : weightedMargins(1, dp(8), 0, dp(8), 0));
+        } else {
+            biosStatus = null;
+            biosButton = null;
+        }
 
         infoStatus = text("", 13, Color.rgb(177, 187, 216));
         infoStatus.setGravity(Gravity.CENTER);
@@ -387,7 +421,9 @@ public class GbaSetupActivity extends Activity {
             patchButton.setEnabled(sourceReady);
             patchButton.setAlpha(sourceReady ? 1.0f : 0.45f);
         }
-        setAssetStatus(biosStatus, biosButton, biosReady, "BIOS", config.biosRequired);
+        if (biosStatus != null) {
+            setAssetStatus(biosStatus, biosButton, biosReady, "BIOS", config.biosRequired);
+        }
         playButton.setEnabled(ready());
         playButton.setAlpha(playButton.isEnabled() ? 1.0f : 0.35f);
 
@@ -430,7 +466,8 @@ public class GbaSetupActivity extends Activity {
             .putBoolean(SKIP_LAUNCHER_ON_BOOT,
                 skipLauncherCheck == null || skipLauncherCheck.isChecked())
             .apply();
-        startActivity(new Intent(this, gameActivityClass()));
+        if (config.skipSetupWhenReady) startGameAndFinish();
+        else startActivity(new Intent(this, gameActivityClass()));
     }
 
     private boolean skipLauncherOnBoot() {
@@ -688,7 +725,7 @@ public class GbaSetupActivity extends Activity {
     }
 
     private void setBusy(boolean busy, String label) {
-        biosButton.setEnabled(!busy);
+        if (biosButton != null) biosButton.setEnabled(!busy);
         romButton.setEnabled(!busy);
         if (patchButton != null)
             patchButton.setEnabled(!busy && sourceRomFile().isFile());
